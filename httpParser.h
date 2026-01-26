@@ -13,6 +13,6 @@ typedef struct {
     header_t* headers;
 }httpInfo_t;
 
-httpInfo_t extractHttpInfo(char* httpString, char* headerEnd);
+httpInfo_t extractHttpInfo(char* httpString);
 
 #endif

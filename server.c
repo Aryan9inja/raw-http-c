@@ -58,7 +58,7 @@ int main() {
         char* buffPtr = NULL;
 
         if ((buffPtr = strstr(buffer, "\r\n\r\n")) != NULL) {
-            httpInfo_t httpInfo = extractHttpInfo(buffer, &buffPtr);
+            httpInfo_t httpInfo = extractHttpInfo(buffer);
 
             break;
         }

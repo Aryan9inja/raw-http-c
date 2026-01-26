@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include "httpParser.h"
 
-httpInfo_t extractHttpInfo(char* httpString, char* headerEnd) {
+httpInfo_t extractHttpInfo(char* httpString) {
     httpInfo_t httpInfo;
 
     int capacity = 10;
@@ -45,7 +45,7 @@ httpInfo_t extractHttpInfo(char* httpString, char* headerEnd) {
 
     int headerIdx = 0;
     int i = 1;
-    while (lines[i] != NULL && lines[i]!=headerEnd) {
+    while (lines[i] != NULL) {
         char* headerSavePtr = NULL;
 
         char* key = __strtok_r(lines[i], ":", &headerSavePtr);
