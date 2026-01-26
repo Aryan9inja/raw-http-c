@@ -4,17 +4,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include "httpParser.h"
 
 #define PORT 8080
 
 int main() {
     int server_fd, new_socket;
-    ssize_t valread;
     int opt = 1;
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
-    char buffer[1024] = { 0 };
 
     // Creating socket file descriptor
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -49,26 +46,40 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    int total_bytes = 0;
+    size_t bufferSize = 1024;
+    char* buffer = malloc(sizeof(char) * bufferSize);
+    if (buffer == NULL) {
+        perror("Buffer Malloc Failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ssize_t valread;
+    size_t readOffset = 0;
+    char* headerEnd = NULL;
     while (1) {
-        valread = read(new_socket, buffer + total_bytes, 1024 - total_bytes - 1);
-        if (valread <= 0) break;
+        valread = read(new_socket, buffer + readOffset, bufferSize - 1 - readOffset);
 
-        total_bytes += valread;
-        char* buffPtr = NULL;
-
-        if ((buffPtr = strstr(buffer, "\r\n\r\n")) != NULL) {
-            httpInfo_t httpInfo = extractHttpInfo(buffer);
-
+        if (valread > 0) {
+            readOffset += valread;
+            buffer[readOffset] = '\0';
+        }
+        else if (valread == 0) {
+            // Client closed the connection
+            break;
+        }
+        else {
+            perror("Read Error");
             break;
         }
 
-        if (total_bytes >= 1023) {
-            printf("Buffer end before http parsing");
+        if ((headerEnd = strstr(buffer, "\r\n\r\n")) != NULL) {
+            printf("Header end is \n%s\n", headerEnd);
+            //Parse header/request here using header end
             break;
         }
     }
 
+    free(buffer);
     close(new_socket);
     close(server_fd);
 
