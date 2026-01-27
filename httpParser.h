@@ -2,17 +2,24 @@
 #define HTTP_PARSER_H
 
 typedef struct {
-    char* key;
-    char* value;
+    const char* data;
+    size_t len;
+}bufferView_t;
+typedef struct {
+    bufferView_t key;
+    bufferView_t value;
 }header_t;
 
 typedef struct {
-    char* method;
-    char* path;
-    char* version;
+    bufferView_t method;
+    bufferView_t path;
+    bufferView_t version;
+    size_t headerCnt;
     header_t* headers;
+    size_t contentLength;
+    bufferView_t contentType;
 }httpInfo_t;
 
-httpInfo_t extractHttpInfo(char* httpString);
+httpInfo_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray);
 
 #endif

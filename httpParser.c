@@ -3,70 +3,128 @@
 #include <stdlib.h>
 #include "httpParser.h"
 
-httpInfo_t extractHttpInfo(char* httpString) {
-    httpInfo_t httpInfo;
-
-    int capacity = 10;
-    char* saveptr = NULL;
-    char* line = __strtok_r(httpString, "\r\n", &saveptr);
-    char** lines = malloc(capacity * sizeof(char*));
-
-    int lineCnt = 0;
-    while (line != NULL) {
-        lines[lineCnt] = line;
-        printf("%s\n\n", lines[lineCnt]);
-        line = __strtok_r(NULL, "\r\n", &saveptr);
-        lineCnt++;
-        if (lineCnt >= capacity) {
-            capacity *= 2;
-            lines = realloc(lines, capacity * sizeof(char*));
+char* strstr_len(const char* haystack, const char* needle, size_t len) {
+    size_t needle_len = strlen(needle);
+    if (needle_len > len) return NULL;
+    for (size_t i = 0; i <= len - needle_len; i++) {
+        if (strncmp(&haystack[i], needle, needle_len) == 0) {
+            return (char*)&haystack[i];
         }
     }
-    lines[lineCnt] = NULL;
+    return NULL;
+}
 
-    saveptr = NULL;
-    char* firstLineWord = __strtok_r(lines[0], " ", &saveptr);
-    char* firstLineWords[3];
+httpInfo_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray) {
+    httpInfo_t httpInfo = {
+        .method = {NULL, 0},
+        .path = {NULL, 0},
+        .version = {NULL, 0},
+        .headerCnt = 0,
+        .headers = headerArray,
+        .contentLength = 0,
+        .contentType = {NULL,0},
+    };
 
-    printf("\n\nDebug\n\n");
-    int firstLineWordCnt = 0;
-    while (firstLineWord != NULL) {
-        firstLineWords[firstLineWordCnt] = firstLineWord;
-        printf("%s\n", firstLineWords[firstLineWordCnt]);
-        firstLineWord = __strtok_r(NULL, " ", &saveptr);
-        firstLineWordCnt++;
+    // First line offset
+    char* firstLineEnd = strstr(buffer, "\r\n");
+    if (!firstLineEnd) {
+        fprintf(stderr, "Malformed request\n");
+        return httpInfo;
     }
-    httpInfo.method = firstLineWords[0];
-    httpInfo.path = firstLineWords[1];
-    httpInfo.version = firstLineWords[2];
+    size_t firstLineLength = firstLineEnd - buffer;
 
-    printf("\n\nDebug2\n\n");
-    httpInfo.headers = malloc(lineCnt * sizeof(header_t));
+    // ---- Parsing Request line ----
 
-    int headerIdx = 0;
-    int i = 1;
-    while (lines[i] != NULL) {
-        char* headerSavePtr = NULL;
+    // Parsing Method
+    char* methodEnd = memchr(buffer, ' ', firstLineLength);
+    if (!methodEnd) {
+        fprintf(stderr, "Invalid HTTP request\n");
+        return httpInfo;
+    }
+    size_t methodLength = methodEnd - buffer;
+    httpInfo.method.data = buffer;
+    httpInfo.method.len = methodLength;
 
-        char* key = __strtok_r(lines[i], ":", &headerSavePtr);
-        char* value = __strtok_r(NULL, " ", &headerSavePtr);
+    // Parsing Path
+    firstLineLength -= methodLength;
+    char* pathStart = methodEnd;
+    while (pathStart[0] == ' ') {
+        pathStart++;
+        firstLineLength--;
+    }
+    char* pathEnd = memchr(pathStart, ' ', firstLineLength);
+    if (!pathEnd) {
+        fprintf(stderr, "No space b/w path and version\n");
+        return httpInfo;
+    }
+    size_t pathLength = pathEnd - pathStart;
+    httpInfo.path.data = pathStart;
+    httpInfo.path.len = pathLength;
 
-        if (key && value) {
-            printf("Header Found -> %s:%s\n", key, value);
-            httpInfo.headers[headerIdx].key = key;
-            httpInfo.headers[headerIdx].value = value;
-            headerIdx++;
+    firstLineLength -= pathLength;
+    char* versionStart = pathEnd;
+    while (versionStart[0] == ' ') {
+        versionStart++;
+        firstLineLength--;
+    }
+    size_t versionLength = firstLineEnd - versionStart;
+    httpInfo.version.data = versionStart;
+    httpInfo.version.len = versionLength;
+
+    // ---- Parsing Headers ----
+    char* headerStart = firstLineEnd + 2;
+    if (headerStart >= headerEnd) {
+        fprintf(stderr, "No headers\n");
+        return httpInfo;
+    }
+    size_t headerCnt = 0;
+    while (headerStart < headerEnd) {
+        size_t remaining = headerEnd - headerStart;
+        char* lineEnd = strstr_len(headerStart, "\r\n", remaining);
+
+        // If we hit the empty line (\r\n\r\n), we are done
+        if (!lineEnd || lineEnd == headerStart) break;
+
+        size_t lineLength = lineEnd - headerStart;
+        char* colon = memchr(headerStart, ':', lineLength);
+
+        if (colon) {
+            // Key is from start to colon
+            size_t keyLen = colon - headerStart;
+            httpInfo.headers[headerCnt].key.data = headerStart;
+            httpInfo.headers[headerCnt].key.len = keyLen;
+
+            // Value starts AFTER colon
+            char* valStart = colon + 1;
+            while (valStart < lineEnd && *valStart == ' ') valStart++;
+            size_t valLen = lineEnd - valStart;
+
+            httpInfo.headers[headerCnt].value.data = valStart;
+            httpInfo.headers[headerCnt].value.len = valLen;
+
+            if (keyLen == 12 && strncasecmp(headerStart, "Content-Type", keyLen) == 0) {
+                httpInfo.contentType.data = valStart;
+                httpInfo.contentType.len = lineEnd - valStart;
+            }
+            else if (keyLen == 14 && strncasecmp(headerStart, "Content-Length", keyLen) == 0) {
+                size_t length = 0;
+                for (size_t i = 0;i < valLen;i++) {
+                    if (valStart[i] >= '0' && valStart[i] <= '9') {
+                        length = length * 10 + (valStart[i] - '0');
+                    }
+                    else {
+                        break;
+                    }
+                }
+                httpInfo.contentLength = length;
+            }
+
+            headerCnt++;
         }
-        i++;
-    }
 
-    int contentLength = 0;
-    for (int j = 0;j < headerIdx;j++) {
-        if (httpInfo.headers[j].key != NULL && strcasecmp(httpInfo.headers[j].key, "Content-Length") == 0) {
-            contentLength = atoi(httpInfo.headers[j].value);
-            printf("Found Content-Length: %d\n", contentLength);
-        }
+        headerStart = lineEnd + 2; // Jump to next line
     }
+    httpInfo.headerCnt = headerCnt;
 
     return httpInfo;
 }
