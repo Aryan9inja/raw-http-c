@@ -58,6 +58,7 @@ int main() {
 
     ssize_t valread;
     size_t readOffset = 0;
+    size_t parseOffset = 0;
     char* headerEnd = NULL;
     while (1) {
         valread = read(new_socket, buffer + readOffset, bufferSize - 1 - readOffset);
@@ -75,18 +76,41 @@ int main() {
             break;
         }
 
-        if ((headerEnd = strstr(buffer, "\r\n\r\n")) != NULL) {
-            //Parse header/request here using header end
+        // Internal Loop to handle multiple requests in one read
+        while (1) {
             //headerEnd -> protocol delimiter
             // headerBlockEnd -> parser boundary -> For line based CRLF parsing
+            headerEnd = strstr(buffer + parseOffset, "\r\n\r\n");
+            if (!headerEnd) break;
+
+            // Parse request line and headers after we have complete header block
             char* headerBlockEnd = headerEnd + 2;
-            httpInfo_t httpInfo = requestAndHeaderParser(buffer, headerBlockEnd, headerArray);
-            size_t requestLength = (headerEnd - buffer) + 4 + httpInfo.contentLength;
-            if (httpInfo.contentLength > 0 && readOffset >= requestLength) {
-                // Parse body
-                break;
-            }
+            // Passing start of current request, not the buffer start
+            httpInfo_t httpInfo = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, headerArray);
+
+            size_t headerSize = (headerEnd - (buffer + parseOffset)) + 4;
+            size_t totalRequestSize = headerSize + httpInfo.contentLength;
+
+            // Check for full body
+            if (readOffset < parseOffset + totalRequestSize) break;
+
+            // Here we will parse body once the function is written
+            printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
+
+            // ---- Temporary response for testing ----
+            const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            send(new_socket, response, strlen(response), 0);
+
+            parseOffset += totalRequestSize;
         }
+
+        // Shift remaining bytes to the front to prevent buffer overflow
+        size_t remaining = readOffset - parseOffset;
+        if (remaining > 0 && parseOffset > 0) {
+            memmove(buffer, buffer + parseOffset, remaining);
+        }
+        readOffset = remaining;
+        parseOffset = 0;
     }
 
     free(headerArray);
