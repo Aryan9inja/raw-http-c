@@ -29,14 +29,14 @@ error_entry_t error_table[] = {
     {PAYLOAD_TOO_LARGE,413,"Payload Too Large"}
 };
 
-void handleParseError(parserResult_t* res, int socket) {
-    printf("Debug: Parser failed with code %d\n", *res);
+void handleParseError(parserResult_t res, int socket) {
+    printf("Debug: Parser failed with code %d\n", res);
     int status = 400; // Default fallback
     char* msg = "Bad Request";
 
     // Loop through the table to find the specific error
     for (size_t i = 0; i < sizeof(error_table) / sizeof(error_table[0]); i++) {
-        if (error_table[i].result == *res) {
+        if (error_table[i].result == res) {
             status = error_table[i].status_code;
             msg = error_table[i].status_text;
             break;
@@ -135,7 +135,7 @@ int main() {
             httpInfo_t httpInfo;
             parserResult_t parseResult = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, headerArray, &httpInfo);
             if (parseResult != OK) {
-                handleParseError(&parseResult, new_socket);
+                handleParseError(parseResult, new_socket);
                 goto cleanup;
             }
 
