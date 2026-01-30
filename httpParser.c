@@ -140,3 +140,8 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
 
     return OK;
 }
+
+parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo){
+    
+    return OK;
+}

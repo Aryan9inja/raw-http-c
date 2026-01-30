@@ -7,6 +7,8 @@
 #include "httpParser.h"
 
 #define PORT 8080
+#define BUFFER_SIZE 4096
+#define MAX_REQUEST_LIMIT 16384 // This is what max request can be
 
 typedef struct {
     parserResult_t result;
@@ -30,7 +32,6 @@ error_entry_t error_table[] = {
 };
 
 void handleParseError(parserResult_t res, int socket) {
-    printf("Debug: Parser failed with code %d\n", res);
     int status = 400; // Default fallback
     char* msg = "Bad Request";
 
@@ -93,8 +94,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    size_t bufferSize = 1024;
-    char* buffer = malloc(sizeof(char) * bufferSize);
+    size_t bufferSize = BUFFER_SIZE;
+    char* buffer = malloc(bufferSize);
     if (buffer == NULL) {
         fprintf(stderr, "Buffer Malloc Failed\n");
         exit(EXIT_FAILURE);
@@ -142,10 +143,32 @@ int main() {
             size_t headerSize = (headerEnd - (buffer + parseOffset)) + 4;
             size_t totalRequestSize = headerSize + httpInfo.contentLength;
 
+            if (totalRequestSize > bufferSize) {
+                if (totalRequestSize > MAX_REQUEST_LIMIT) {
+                    handleParseError(PAYLOAD_TOO_LARGE, new_socket);
+                    goto cleanup;
+                }
+
+                char* new_buffer = realloc(buffer, totalRequestSize + 1);
+                if (!new_buffer) {
+                    const char* response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                    send(new_socket, response, strlen(response), 0);
+                    goto cleanup;
+                }
+                buffer = new_buffer;
+                bufferSize = totalRequestSize + 1; // Update your tracking variable
+            }
+
             // Check for full body
             if (readOffset < parseOffset + totalRequestSize) break;
 
             // Here we will parse body once the function is written
+            char* bodyStart = buffer + parseOffset + headerSize;
+            parseResult = bodyParser(bodyStart, &httpInfo);
+            if (parseResult != OK) {
+                handleParseError(parseResult, new_socket);
+                goto cleanup;
+            }
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
             // ---- Temporary response for testing ----

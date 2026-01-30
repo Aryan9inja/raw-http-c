@@ -38,4 +38,6 @@ typedef enum {
 
 parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* httpInfo);
 
+parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo);
+
 #endif
