@@ -18,8 +18,24 @@ typedef struct {
     header_t* headers;
     size_t contentLength;
     bufferView_t contentType;
+    int isContentLengthSeen;
 }httpInfo_t;
 
-httpInfo_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray);
+typedef enum {
+    OK,
+    BAD_REQUEST_LINE,
+    BAD_HEADER_SYNTAX,
+    INVALID_VERSION,
+    INVALID_CONTENT_LENGTH,
+    BODY_NOT_ALLOWED,
+    MISSING_REQUIRED_HEADERS,
+    UNSUPPORTED_TRANSFER_ENCODING,
+    UNSUPPORTED_METHOD,
+    HEADER_TOO_LARGE,
+    TOO_MANY_HEADERS,
+    PAYLOAD_TOO_LARGE
+}parserResult_t;
+
+parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* httpInfo);
 
 #endif

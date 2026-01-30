@@ -8,6 +8,52 @@
 
 #define PORT 8080
 
+typedef struct {
+    parserResult_t result;
+    int status_code;
+    char* status_text;
+} error_entry_t;
+
+// Define your mapping once
+error_entry_t error_table[] = {
+    {BAD_REQUEST_LINE,400,"Bad Request"},
+    {BAD_HEADER_SYNTAX,400,"Bad Header Syntax"},
+    {INVALID_VERSION,505,"HTTP Version Not Supported"},
+    {INVALID_CONTENT_LENGTH,400,"Invalid Content Length"},
+    {BODY_NOT_ALLOWED,400,"Body not allowed"},
+    {MISSING_REQUIRED_HEADERS,400,"Missing Required Headers"},
+    {UNSUPPORTED_TRANSFER_ENCODING, 501,"Not Implemented"},
+    {UNSUPPORTED_METHOD,405,"Method Not Allowed"},
+    {HEADER_TOO_LARGE,431,"Request Header Fields Too Large"},
+    {TOO_MANY_HEADERS,400,"Too Many Headers"},
+    {PAYLOAD_TOO_LARGE,413,"Payload Too Large"}
+};
+
+void handleParseError(parserResult_t* res, int socket) {
+    printf("Debug: Parser failed with code %d\n", *res);
+    int status = 400; // Default fallback
+    char* msg = "Bad Request";
+
+    // Loop through the table to find the specific error
+    for (size_t i = 0; i < sizeof(error_table) / sizeof(error_table[0]); i++) {
+        if (error_table[i].result == *res) {
+            status = error_table[i].status_code;
+            msg = error_table[i].status_text;
+            break;
+        }
+    }
+
+    // One single send logic for everything
+    char response[256];
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n",
+        status, msg);
+
+    send(socket, response, len, 0);
+}
+
 int main() {
     int server_fd, new_socket;
     int opt = 1;
@@ -86,7 +132,12 @@ int main() {
             // Parse request line and headers after we have complete header block
             char* headerBlockEnd = headerEnd + 2;
             // Passing start of current request, not the buffer start
-            httpInfo_t httpInfo = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, headerArray);
+            httpInfo_t httpInfo;
+            parserResult_t parseResult = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, headerArray, &httpInfo);
+            if (parseResult != OK) {
+                handleParseError(&parseResult, new_socket);
+                goto cleanup;
+            }
 
             size_t headerSize = (headerEnd - (buffer + parseOffset)) + 4;
             size_t totalRequestSize = headerSize + httpInfo.contentLength;
@@ -113,6 +164,7 @@ int main() {
         parseOffset = 0;
     }
 
+cleanup:
     free(headerArray);
     free(buffer);
     close(new_socket);
