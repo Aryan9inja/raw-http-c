@@ -1,12 +1,17 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g
 
 TARGET = server
 
 SRCS = server.c httpParser.c
 OBJS = $(SRCS:.c=.o)
 
-all:$(TARGET)
+all: dev
+
+dev: CFLAGS = -Wall -Wextra -g
+dev: $(TARGET)
+
+prod: CFLAGS =
+prod: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^

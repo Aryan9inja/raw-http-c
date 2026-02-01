@@ -19,6 +19,7 @@ typedef struct {
     size_t contentLength;
     bufferView_t contentType;
     int isContentLengthSeen;
+    bufferView_t body;
 }httpInfo_t;
 
 typedef enum {

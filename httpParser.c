@@ -142,6 +142,7 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
 }
 
 parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo){
-    
+    httpInfo->body.data=bodyStart;
+    httpInfo->body.len=httpInfo->contentLength;
     return OK;
 }
