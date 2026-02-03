@@ -172,7 +172,8 @@ int main() {
             }
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
-            sendResponse(new_socket, &httpInfo);
+            response_t response = requestHandler(&httpInfo);
+            sendResponse(new_socket, &response);
 
             printf("Response sent");
 

@@ -21,6 +21,8 @@ typedef enum {
     Ok
 }requestResponse_t;
 
-requestResponse_t sendResponse(int socket, httpInfo_t* httpInfo);
+response_t requestHandler(httpInfo_t* httpInfo);
+
+requestResponse_t sendResponse(int socket, response_t* response);
 
 #endif
