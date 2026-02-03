@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <string.h>
 #include "httpParser.h"
+#include "handlers.h"
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
@@ -171,9 +172,9 @@ int main() {
             }
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
-            // ---- Temporary response for testing ----
-            const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-            send(new_socket, response, strlen(response), 0);
+            sendResponse(new_socket, &httpInfo);
+
+            printf("Response sent");
 
             parseOffset += totalRequestSize;
         }

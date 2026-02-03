@@ -2,7 +2,7 @@ CC = gcc
 
 TARGET = server
 
-SRCS = server.c httpParser.c
+SRCS = server.c httpParser.c handlers.c
 OBJS = $(SRCS:.c=.o)
 
 all: dev

@@ -1,6 +1,8 @@
 #ifndef HTTP_PARSER_H
 #define HTTP_PARSER_H
 
+#include <stddef.h>
+
 typedef struct {
     const char* data;
     size_t len;
