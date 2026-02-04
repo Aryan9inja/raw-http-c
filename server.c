@@ -11,13 +11,14 @@
 #define BUFFER_SIZE 4096
 #define MAX_REQUEST_LIMIT 16384 // This is what max request can be
 
+// Structure mapping parser errors to HTTP status codes
 typedef struct {
     parserResult_t result;
     int status_code;
     char* status_text;
 } error_entry_t;
 
-// Define your mapping once
+// Map parser errors to appropriate HTTP responses
 error_entry_t error_table[] = {
     {BAD_REQUEST_LINE,400,"Bad Request"},
     {BAD_HEADER_SYNTAX,400,"Bad Header Syntax"},
@@ -32,6 +33,7 @@ error_entry_t error_table[] = {
     {PAYLOAD_TOO_LARGE,413,"Payload Too Large"}
 };
 
+// Handle parser errors by sending appropriate HTTP error response
 void handleParseError(parserResult_t res, int socket) {
     int status = 400; // Default fallback
     char* msg = "Bad Request";
@@ -45,7 +47,7 @@ void handleParseError(parserResult_t res, int socket) {
         }
     }
 
-    // One single send logic for everything
+    // Send HTTP error response
     char response[256];
     int len = snprintf(response, sizeof(response),
         "HTTP/1.1 %d %s\r\n"
@@ -68,11 +70,12 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Setting socket options, specially port
+    // Configure socket to allow port reuse
     if ((setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) < 0) {
         fprintf(stderr, "Socket option setup failed\n");
         exit(EXIT_FAILURE);
     }
+    // Set up address structure for binding
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
@@ -95,6 +98,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    // Allocate buffer for reading HTTP requests
     size_t bufferSize = BUFFER_SIZE;
     char* buffer = malloc(bufferSize);
     if (buffer == NULL) {
@@ -102,16 +106,20 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    // Allocate array to store parsed headers
     header_t* headerArray = malloc(sizeof(header_t) * 100);
 
     ssize_t valread;
     size_t readOffset = 0;
     size_t parseOffset = 0;
     char* headerEnd = NULL;
+    
+    // Main loop: read data from client
     while (1) {
         valread = read(new_socket, buffer + readOffset, bufferSize - 1 - readOffset);
 
         if (valread > 0) {
+            // Successfully read data
             readOffset += valread;
             buffer[readOffset] = '\0';
         }
@@ -124,14 +132,13 @@ int main() {
             break;
         }
 
-        // Internal Loop to handle multiple requests in one read
+        // Parse multiple requests that may be in the buffer
         while (1) {
-            //headerEnd -> protocol delimiter
-            // headerBlockEnd -> parser boundary -> For line based CRLF parsing
+            // Look for end of HTTP headers (\r\n\r\n)
             headerEnd = strstr(buffer + parseOffset, "\r\n\r\n");
             if (!headerEnd) break;
 
-            // Parse request line and headers after we have complete header block
+            // Parse request line and headers
             char* headerBlockEnd = headerEnd + 2;
             // Passing start of current request, not the buffer start
             httpInfo_t httpInfo;
@@ -141,9 +148,11 @@ int main() {
                 goto cleanup;
             }
 
+            // Calculate total size needed for this request
             size_t headerSize = (headerEnd - (buffer + parseOffset)) + 4;
             size_t totalRequestSize = headerSize + httpInfo.contentLength;
 
+            // Resize buffer if needed to accommodate the full request
             if (totalRequestSize > bufferSize) {
                 if (totalRequestSize > MAX_REQUEST_LIMIT) {
                     handleParseError(PAYLOAD_TOO_LARGE, new_socket);
@@ -160,10 +169,10 @@ int main() {
                 bufferSize = totalRequestSize + 1; // Update your tracking variable
             }
 
-            // Check for full body
+            // Wait for complete body if not all received yet
             if (readOffset < parseOffset + totalRequestSize) break;
 
-            // Here we will parse body once the function is written
+            // Parse the request body
             char* bodyStart = buffer + parseOffset + headerSize;
             parseResult = bodyParser(bodyStart, &httpInfo);
             if (parseResult != OK) {
@@ -172,15 +181,17 @@ int main() {
             }
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
+            // Generate and send response
             response_t response = requestHandler(&httpInfo);
             sendResponse(new_socket, &response);
+            if(response.shouldClose==1) goto cleanup;
 
             printf("Response sent");
 
             parseOffset += totalRequestSize;
         }
 
-        // Shift remaining bytes to the front to prevent buffer overflow
+        // Shift remaining unparsed bytes to the front of the buffer
         size_t remaining = readOffset - parseOffset;
         if (remaining > 0 && parseOffset > 0) {
             memmove(buffer, buffer + parseOffset, remaining);
@@ -190,6 +201,7 @@ int main() {
     }
 
 cleanup:
+    // Clean up and close connections
     free(headerArray);
     free(buffer);
     close(new_socket);

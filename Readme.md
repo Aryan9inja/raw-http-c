@@ -1,99 +1,164 @@
-# RAW HTTP SERVER IN C
-This is a doc for my future self.
-What I want to do is to create a HTTP server in C.
+# HTTP/1.1 Server in C - v0.2
 
-## What I have done so far
-- Created a basic TCP server that listens on a port and accepts connections.
-- Currently the connection is closed immediately after being accepted.
+A lightweight HTTP/1.1 server implementation in C with persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
 
-# Goal and Scope [Current Version]
-## Create parsers for HTTP requests
-- Works on HTTP/1.x only for now.
-- No chuncked transfer encoding yet.
-- One connection, multiple requests (keep-alive).
-- Should be binary safe (able to handle any byte sequence).
-- Should be able to handle large payloads incrementally (future: streaming / partial body handling).
-- Should be able to handle pipelined requests.
+## Features
 
-## Core assumptions
-- TCP stream is reliable and in order.
-- Requests may arive fragmented or combined.
-- Parser does not own the memory buffer, it just reads from it.
-- Parser data is invalid after the buffer is freed or modified.
+### Core Capabilities
+- **HTTP/1.1 Protocol**: Full HTTP/1.1 request parsing and response generation
+- **Keep-Alive Connections**: Persistent connections with multiple requests per connection (new in v0.2)
+- **Request Pipelining**: Handle multiple pipelined requests efficiently
+- **Zero-Copy Parsing**: Memory-efficient parsing using buffer views without duplication
+- **Binary Safe**: Handles arbitrary byte sequences in request/response bodies
+- **Dynamic Buffers**: Automatic buffer growth up to configurable limits
 
-## Buffer Model
-- One dynamic buffer per connection.
-- Buffer can contain partial or multiple requests.
-- Bytes are consumed from the buffer as request completes.
-- By bytes consumed, I mean the parser will indicate how many bytes were used for the completed request.
-- Pointers like read-offset and parse-offset will be used to track progress.
-- After a request is fully parsed, the buffer is advanced by the number of bytes consumed.
-- Remaining bytes are preserved for next request parsing.
+### Current Endpoints
+- `GET /` - Returns "Hello" message
+- `POST /echo` - Echoes the request body back to client
 
-## Request Boundary Detection
-- Detect end of headers by looking for double CRLF (`\r\n\r\n`).
-- Determine body length using `Content-Length` header.
-- For requests without body (e.g. GET), consider headers end as request end.
-- For requests with body, wait until full body is received based on `Content-Length`.
-- Handle pipelined requests by continuing to parse remaining buffer after completing a request.
+## Architecture
 
-## Parsing Responsibilities
-### Header Parser
-- Extract method, path, version from request line.
-- Parse headers into key-value pairs.
-- Will return method, path, version as strings.
-- Will return headers as a list of key-value pairs.
-- Will also return content-length and content-type if present.
+The server is organized into three main components:
 
-### Body Parser
-- Called only if `Content-Length` is present and greater than 0.
-- Use `Content-Type` header to determine how to parse body (e.g. JSON, form data). Currently just plain text.
-- Binary safe: should handle any byte sequence.
-- Body data is treated as raw bytes and is not null-terminated.
+### 1. Server Core ([server.c](server.c))
+- TCP socket management and connection lifecycle
+- Dynamic buffer allocation and management (4KB initial, 16KB max)
+- Request pipelining with read/parse offset tracking
+- Keep-alive connection loop
+- Error handling and HTTP error response generation
 
-## Memory Ownership Contract
-### Who owns the buffer?
-- The buffer is owned by the connection handler.
-- The parser functions will not allocate or free memory for the buffer.
-- The parser functions will return pointers into the existing buffer.
+**Documentation**: [docs/server.md](docs/server.md)
 
-### Who owns the parsed data?
-- Parsed fields are views into the buffer
-- No individual field should ever be freed
-- Only the buffer is freed (by connection handler)
+### 2. HTTP Parser ([httpParser.c](httpParser.c))
+- Zero-copy HTTP/1.1 request parsing
+- Request line extraction (method, path, version)
+- Header parsing into key-value pairs
+- Content-Length and Connection header processing
+- Body boundary detection
+- Keep-alive detection via Connection header
 
-### When does memory become invalid?
-- The parsed data becomes invalid when the buffer is modified (e.g. bytes are consumed).
-- The parsed data also becomes invalid when the connection is closed and buffer is freed.
+**Documentation**: [docs/httpParser.md](docs/httpParser.md)
 
-### What must the caller not do?
-- The caller must not free or modify the buffer while parsed data is still in use.
-- The caller must not assume parsed data remains valid after modifying the buffer.
-- The caller must not use parsed data after closing the connection and freeing the buffer.
-- The caller must not modify the buffer in a way that invalidates parsed data (e.g. reallocating or freeing).
-- The caller must not pass a NULL or invalid buffer pointer to the parser functions.
-- The caller must not assume the parser functions will handle memory allocation for parsed data.
-- The caller must not use parsed data after the next parse call, as it may be overwritten.
+### 3. Request Handlers ([handlers.c](handlers.c))
+- Request routing and dispatch
+- Response generation with appropriate status codes
+- HTTP response formatting and transmission
+- Keep-alive state propagation
+- Memory management for response bodies
 
-## Request Lifecycle
-1. Connection accepted, buffer initialized.
-2. Data received, appended to buffer.
-3. Detect Header Boundary.
-4. Parse Headers.
-5. If body present, wait for full body.
-6. Parse Body.
-7. Process Request.
-8. Advance buffer by consumed bytes.
-9. Repeat from step 2 for next request.
+**Documentation**: [docs/handlers.md](docs/handlers.md)
 
-## Non-Goals/Future Work
-- Chunked transfer encoding.
-- Multipart Parsing.
-- Keep-Alive optimizations.
-- Concurrency Model.
+## Design Principles
 
-## Failure Modes/Expected Errors
-- Incomplete headers.
-- Invalid content-length.
-- Body shorter than content-length.
-- Oversized headers/body (exceeding buffer limits).
+### Zero-Copy Parsing
+The parser uses `bufferView_t` structures (pointer + length) to reference data directly in the connection buffer without copying or allocating memory. This eliminates unnecessary allocations while maintaining safety through careful lifetime management.
+
+### Buffer Model
+- **Dynamic Per-Connection Buffer**: Each connection has its own buffer that grows as needed
+- **Read/Parse Offsets**: Track bytes read vs. bytes parsed to support pipelining
+- **Buffer Shifting**: After parsing, unparsed bytes are moved to buffer start using `memmove()`
+- **Incremental Parsing**: Handles fragmented requests across multiple `read()` calls
+
+### Memory Ownership Contract
+- **Server owns buffer**: Connection handler allocates, reallocates, and frees the buffer
+- **Parser returns views**: All parsed data (method, path, headers, body) are non-owning `bufferView_t` pointers into the buffer
+- **Lifetime constraints**: Parsed data is valid only until the next buffer modification (realloc, memmove, or free)
+- **No parser allocations**: Parser never calls `malloc()` - zero memory overhead
+
+### Keep-Alive Implementation (v0.2)
+HTTP/1.1 connections default to persistent mode:
+1. Parser checks for `Connection: close` header
+2. Sets `isKeepAlive` flag in parsed request
+3. Handler mirrors flag to `shouldClose` in response
+4. Response includes appropriate `Connection` header
+5. Server loop continues or exits based on `shouldClose`
+
+## Protocol Support
+
+### Supported
+- HTTP/1.1 request/response
+- Persistent connections (keep-alive)
+- Request pipelining
+- Content-Length based body parsing
+- Binary request/response bodies
+- GET and POST methods
+- Connection header handling
+
+### Not Yet Supported
+- HTTP/1.0 (different keep-alive semantics)
+- HTTP/2
+- Chunked transfer encoding
+- Multipart/form-data parsing
+- Static file serving (planned for future release)
+- HTTPS/TLS
+- Additional HTTP methods (HEAD, PUT, DELETE, OPTIONS, etc.)
+- Compression (gzip/deflate)
+
+## Building and Running
+
+### Build
+```bash
+make          # Build with debug symbols and warnings (dev mode)
+make prod     # Build production version
+```
+
+### Run
+```bash
+make run      # Build and start server on port 8080
+```
+
+### Clean
+```bash
+make clean    # Remove build artifacts
+```
+
+## Testing
+
+Example using `curl`:
+
+```bash
+# GET request
+curl http://localhost:8080/
+
+# POST echo
+curl -X POST http://localhost:8080/echo -d "Hello, Server!"
+
+# Keep-alive (multiple requests, single connection)
+curl -v http://localhost:8080/ http://localhost:8080/echo
+
+# Request with explicit Connection: close
+curl -H "Connection: close" http://localhost:8080/
+```
+
+## Limitations & Known Issues
+
+### Current Limitations
+- **Single connection only**: Server handles one connection at a time and exits after it closes
+- **No concurrency**: No threading or process forking
+- **Limited routes**: Only 2 endpoints (/ and /echo)
+- **No static files**: Cannot serve HTML, CSS, JS, or other files
+- **No timeouts**: Connections can hang indefinitely
+- **Hardcoded port**: Always uses port 8080
+- **No logging**: Minimal debug output only
+
+See individual component documentation for detailed limitations and assumptions.
+
+## Future Goals
+
+### v0.3 Roadmap
+- **Static file serving**: Serve files from document root directory
+- **Content-Type detection**: Automatic MIME type handling based on file extensions
+- **Directory listing**: Auto-generated index pages for directories
+
+### Long-term Goals
+- Multi-threading for concurrent connections
+- Configurable ports and settings
+- Comprehensive logging system
+- Chunked transfer encoding
+- Additional HTTP methods (HEAD, PUT, DELETE, OPTIONS)
+- HTTP compression support
+- Performance optimizations (zero-copy I/O, buffer pooling)
+
+## Code Attribution
+
+All of the C code till now is written by **Aryan Singh Thakur** only. The documentation is written with the help of AI.
