@@ -144,11 +144,19 @@ curl -H "Connection: close" http://localhost:8080/
 See individual component documentation for detailed limitations and assumptions.
 
 ## Future Goals
+### v0.3 — Multi-Connection via fork()
+- Primary concept: process-based concurrency
+- Parent process accepts connections
+- Child process handles exactly one client
+- Clear separation of responsibilities
+- Learn process isolation, lifecycle, and cost
 
-### v0.3 Roadmap
-- **Static file serving**: Serve files from document root directory
-- **Content-Type detection**: Automatic MIME type handling based on file extensions
-- **Directory listing**: Auto-generated index pages for directories
+### v0.4 — Static File Serving
+- Primary concept: filesystem + HTTP interaction
+- Serve files from a document root
+- Content-Type detection
+- Safe path resolution
+- Efficient file streaming
 
 ### Long-term Goals
 - Multi-threading for concurrent connections
@@ -162,3 +170,5 @@ See individual component documentation for detailed limitations and assumptions.
 ## Code Attribution
 
 All of the C code till now is written by **Aryan Singh Thakur** only. The documentation is written with the help of AI.
+
+Each version exists to teach one systems concept.
