@@ -1,9 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <sys/time.h>
 #include "httpParser.h"
 #include "handlers.h"
 
@@ -30,7 +35,8 @@ error_entry_t error_table[] = {
     {UNSUPPORTED_METHOD,405,"Method Not Allowed"},
     {HEADER_TOO_LARGE,431,"Request Header Fields Too Large"},
     {TOO_MANY_HEADERS,400,"Too Many Headers"},
-    {PAYLOAD_TOO_LARGE,413,"Payload Too Large"}
+    {PAYLOAD_TOO_LARGE,413,"Payload Too Large"},
+    {REQUEST_TIMEOUT,408,"Request Timeout"}
 };
 
 // Handle parser errors by sending appropriate HTTP error response
@@ -58,46 +64,14 @@ void handleParseError(parserResult_t res, int socket) {
     send(socket, response, len, 0);
 }
 
-int main() {
-    int server_fd, new_socket;
-    int opt = 1;
-    struct sockaddr_in address;
-    socklen_t addrlen = sizeof(address);
+void burnZombies(int s) {
+    (void)s; // Tell the compiler to shut up
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved_errno;
+}
 
-    // Creating socket file descriptor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        fprintf(stderr, "Socket creation failed\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Configure socket to allow port reuse
-    if ((setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) < 0) {
-        fprintf(stderr, "Socket option setup failed\n");
-        exit(EXIT_FAILURE);
-    }
-    // Set up address structure for binding
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    // Forcefully binding socket to port 8080
-    if (bind(server_fd, (struct sockaddr*)&address, addrlen) < 0) {
-        fprintf(stderr, "Socket bind error\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Listen to the socket
-    if ((listen(server_fd, 3)) < 0) {
-        fprintf(stderr, "Error while listening\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Accept new connection
-    if ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) < 0) {
-        fprintf(stderr, "Error while accepting\n");
-        exit(EXIT_FAILURE);
-    }
-
+void handleClient(int new_socket) {
     // Allocate buffer for reading HTTP requests
     size_t bufferSize = BUFFER_SIZE;
     char* buffer = malloc(bufferSize);
@@ -113,7 +87,7 @@ int main() {
     size_t readOffset = 0;
     size_t parseOffset = 0;
     char* headerEnd = NULL;
-    
+
     // Main loop: read data from client
     while (1) {
         valread = read(new_socket, buffer + readOffset, bufferSize - 1 - readOffset);
@@ -128,7 +102,13 @@ int main() {
             break;
         }
         else {
-            fprintf(stderr, "Read Error\n");
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fprintf(stderr, "Client connection timed out after 10 seconds\n");
+                handleParseError(REQUEST_TIMEOUT, new_socket);
+            }
+            else {
+                fprintf(stderr, "Read Error: %s\n", strerror(errno));
+            }
             break;
         }
 
@@ -184,7 +164,7 @@ int main() {
             // Generate and send response
             response_t response = requestHandler(&httpInfo);
             sendResponse(new_socket, &response);
-            if(response.shouldClose==1) goto cleanup;
+            if (response.shouldClose == 1) goto cleanup;
 
             printf("Response sent");
 
@@ -205,7 +185,87 @@ cleanup:
     free(headerArray);
     free(buffer);
     close(new_socket);
-    close(server_fd);
+    exit(EXIT_SUCCESS);
+}
+
+int main() {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(address);
+    int opt = 1;
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+
+    struct sigaction sa;
+    sa.sa_handler = burnZombies;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction");
+        exit(EXIT_FAILURE);
+    }
+
+    // Creating socket file descriptor
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        fprintf(stderr, "Socket creation failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure socket to allow port reuse
+    if ((setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) < 0) {
+        fprintf(stderr, "Socket address setup failed\n");
+        exit(EXIT_FAILURE);
+    }
+    // Set up address structure for binding
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    // Forcefully binding socket to port 8080
+    if (bind(server_fd, (struct sockaddr*)&address, addrlen) < 0) {
+        fprintf(stderr, "Socket bind error\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Listen to the socket
+    if ((listen(server_fd, 3)) < 0) {
+        fprintf(stderr, "Error while listening\n");
+        exit(EXIT_FAILURE);
+    }
+
+    while (1) {
+        // Accept new connection
+        if ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) < 0) {
+            fprintf(stderr, "Error while accepting\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // Configure socket to timeout after sometime
+        if ((setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) < 0) {
+            fprintf(stderr, "Socket timeout setup failed\n");
+            exit(EXIT_FAILURE);
+        }
+
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("Fork failed");
+            exit(EXIT_FAILURE);
+        }
+        else if (pid == 0) {
+            // Child process will handle the client
+            // It does not care about server file descriptor
+            close(server_fd);
+            handleClient(new_socket);
+        }
+        else {
+            // Parent process will listen for new connections
+            // It does not handle client
+            close(new_socket);
+        }
+    }
 
     return EXIT_SUCCESS;
 }

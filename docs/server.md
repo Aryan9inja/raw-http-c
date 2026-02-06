@@ -146,6 +146,113 @@ The server can process multiple pipelined requests from a single connection:
 - Inner parse loop processes all complete requests in buffer
 - Continues reading only after processing buffered requests
 
+## Process-Based Concurrency (v0.3)
+
+### Multi-Process Architecture
+The server uses `fork()` to handle multiple concurrent client connections simultaneously:
+
+**Parent Process Responsibilities:**
+1. Create and bind server socket on port 8080
+2. Call `listen()` to mark socket as accepting connections
+3. **Infinite accept loop**: Call `accept()` to wait for incoming connections
+4. When connection arrives, call `fork()` to create child process
+5. Parent closes the client socket descriptor (child uses it)
+6. Parent returns to step 3 to accept next connection
+7. Install `SIGCHLD` signal handler to reap zombies at startup
+
+**Child Process Responsibilities:**
+1. Inherit open client socket from parent via `fork()`
+2. Close server socket descriptor immediately (only parent listens)
+3. Run `handleClient()` to process HTTP requests on that socket
+4. Handle keep-alive connections as separate entity from other clients
+5. Exit (via `exit(EXIT_SUCCESS)` in `handleClient()`) when client closes connection
+
+### Zombie Process Reaping
+
+**Problem:** When a child process exits, it becomes a "zombie" — its process table entry remains until parent calls `wait()` or `waitpid()`
+
+**Solution: SIGCHLD Handler**
+```c
+void burnZombies(int s) {
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0);  // Reap all available zombies
+    errno = saved_errno;
+}
+```
+
+**Signal Handler Setup:**
+```c
+struct sigaction sa;
+sa.sa_handler = burnZombies;
+sigemptyset(&sa.sa_mask);
+sa.sa_flags = SA_RESTART;  // Restart interrupted system calls
+sigaction(SIGCHLD, &sa, NULL);
+```
+
+**How It Works:**
+1. Kernel sends `SIGCHLD` signal when child process exits
+2. Parent's signal handler runs asynchronously
+3. `waitpid(-1, NULL, WNOHANG)` reaps one zombie child
+4. Loop continues to reap all available zombies (non-blocking mode)
+5. `errno` saved/restored for signal safety (avoid breaking concurrent system calls)
+
+**Key Points:**
+- Non-blocking wait (`WNOHANG`): Handler doesn't block parent's main loop
+- Loop until no more zombies available (handles burst of child exits)
+- `SA_RESTART` flag: Interrupted system calls (like `accept()`) automatically restart
+- Signal-safe code: Only `waitpid()` called in handler (other calls could corrupt state)
+
+### Process Lifecycle Example
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Parent Process                            │
+│                                                               │
+│  1. socket() → 2. bind() → 3. listen()                       │
+│                       ↓                                       │
+│  4. Setup SIGCHLD handler (reaps zombies)                   │
+│                       ↓                                       │
+│  ┌───────────────────────────────────┐                       │
+│  │ 5. Infinite Loop:                 │                       │
+│  │    accept() → wait for connection │                       │
+│  │       ↓ (connection arrives)       │                       │
+│  │    fork()                          │                       │
+│  │       ├─── Child (PID != 0)        │                       │
+│  │       │    → close(server_fd)      │                       │
+│  │       │    → handleClient(sock)    │                       │
+│  │       │    → exit()                │                       │
+│  │       │                            │                       │
+│  │       └─── Parent (PID == 0)       │                       │
+│  │            → close(client_sock)    │                       │
+│  │            → back to accept()      │                       │
+│  │                                    │                       │
+│  └───────────────────────────────────┘                       │
+│                                                               │
+│  Note: SIGCHLD handler runs asynchronously                  │
+│        when children exit, reaping zombies                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Concurrency Model Characteristics
+
+**Advantages:**
+- **Process Isolation**: Each client completely isolated from others (memory, file descriptors, signals)
+- **No Synchronization**: No mutex/lock needs (no shared state between processes)
+- **Crash Safety**: One client's misbehavior (segfault, infinite loop) doesn't affect others
+- **Simple Cleanup**: Process exit automatically closes client socket and frees memory
+- **Inherited Resources**: Child shares program text (read-only), inherits parent state via copy-on-write
+
+**Disadvantages:**
+- **Memory Overhead**: Each process duplicates program data / stacks (even with copy-on-write)
+- **Process Creation Cost**: `fork()` and context switches more expensive than thread creation
+- **Scalability Limit**: OS limits on process count (practical limit: 10K-100K processes)
+- **No Shared Resources**: Can't easily pool resources like database connections across clients
+
+**Suitable For:**
+- Learning process-based concurrency model
+- Moderate connection counts (< 1K concurrent clients)
+- Teaching systems concepts: fork, wait, signals, process isolation
+
 ## Critical Invariants
 
 ### Buffer Invariants
@@ -168,12 +275,12 @@ The server can process multiple pipelined requests from a single connection:
 
 ## Known Limitations & Missing Features
 
-### Concurrency & Scalability
-- **Single Connection Only**: Server exits after first connection closes
-- **No Threading**: Cannot handle concurrent connections
-- **No Process Forking**: No multi-process model
-- **No Event Loop**: Blocking I/O only (no epoll/kqueue/select)
-- **Small Listen Backlog**: `listen(3)` provides minimal queue
+### Concurrency & Scalability (v0.3 Partial Improvement)
+- ✅ **Process-Per-Connection**: Server now handles multiple concurrent clients via `fork()`
+- ✅ **Zombie Process Cleanup**: SIGCHLD handler prevents accumulation of defunct children
+- ❌ **No Threading**: No alternative threaded model yet
+- ❌ **No Event Loop**: Blocking I/O only (no epoll/kqueue/select)
+- ❌ **Small Listen Backlog**: `listen(3)` provides minimal queue
 
 ### Timeouts & Resource Management
 - **No Connection Timeout**: Can hang indefinitely waiting for client data
@@ -204,10 +311,11 @@ The server can process multiple pipelined requests from a single connection:
 - **No Debug Mode**: No verbose logging option
 
 ### Signal Handling & Lifecycle
-- **No Graceful Shutdown**: SIGINT/SIGTERM terminate abruptly
-- **No Signal Handlers**: Cannot handle SIGPIPE, SIGHUP, etc.
-- **No Cleanup on Exit**: Resources may leak on abnormal termination
-- **No Daemon Mode**: Cannot run as background service
+- ✅ **SIGCHLD Handler (v0.3)**: Reaps child processes via `burnZombies()` function
+- ❌ **No Graceful Shutdown**: SIGINT/SIGTERM terminate abruptly
+- ❌ **No Other Signal Handlers**: Cannot handle SIGPIPE, SIGHUP, etc.
+- ❌ **No Cleanup on Exit**: Resources may leak on abnormal termination
+- ❌ **No Daemon Mode**: Cannot run as background service
 
 ### Protocol Features
 - **No HTTP/1.0 Support**: Only HTTP/1.1 accepted

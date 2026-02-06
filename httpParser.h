@@ -62,7 +62,8 @@ typedef enum {
     UNSUPPORTED_METHOD,
     HEADER_TOO_LARGE,
     TOO_MANY_HEADERS,
-    PAYLOAD_TOO_LARGE
+    PAYLOAD_TOO_LARGE,
+    REQUEST_TIMEOUT
 }parserResult_t;
 
 /**

@@ -1,12 +1,16 @@
-# HTTP/1.1 Server in C - v0.2
+# HTTP/1.1 Server in C - v0.3
 
-A lightweight HTTP/1.1 server implementation in C with persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
+A lightweight HTTP/1.1 server implementation in C with process-based concurrency, persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
 
 ## Features
 
 ### Core Capabilities
+- **Process-Based Concurrency (v0.3)**: Handle multiple concurrent clients using `fork()` 
+  - Parent process accepts connections; child processes handle individual clients
+  - Clear process isolation and lifecycle management
+  - Zero-copy architecture maintained across concurrent connections
 - **HTTP/1.1 Protocol**: Full HTTP/1.1 request parsing and response generation
-- **Keep-Alive Connections**: Persistent connections with multiple requests per connection (new in v0.2)
+- **Keep-Alive Connections**: Persistent connections with multiple requests per connection within each client process
 - **Request Pipelining**: Handle multiple pipelined requests efficiently
 - **Zero-Copy Parsing**: Memory-efficient parsing using buffer views without duplication
 - **Binary Safe**: Handles arbitrary byte sequences in request/response bodies
@@ -18,7 +22,19 @@ A lightweight HTTP/1.1 server implementation in C with persistent connection sup
 
 ## Architecture
 
-The server is organized into three main components:
+The server is organized into three main components with process-based concurrency:
+
+### 0. Server Architecture (v0.3)
+- **Parent Process**: Single server loop that listens on port 8080
+  - Accepts incoming TCP connections in an infinite loop
+  - Forks a child process for each new connection
+  - Returns to listening for the next connection
+  - Reaps child processes via `SIGCHLD` handler (prevents zombies)
+- **Child Process**: One process per client connection
+  - Inherits open client socket from parent via `fork()`
+  - Closes server socket descriptor (not needed)
+  - Runs the complete HTTP connection lifecycle independently
+  - Exits after client closes connection
 
 ### 1. Server Core ([server.c](server.c))
 - TCP socket management and connection lifecycle
@@ -72,6 +88,30 @@ HTTP/1.1 connections default to persistent mode:
 3. Handler mirrors flag to `shouldClose` in response
 4. Response includes appropriate `Connection` header
 5. Server loop continues or exits based on `shouldClose`
+
+### Process-Based Concurrency Model (v0.3)
+The server uses `fork()` to handle multiple concurrent clients without threading or async I/O:
+
+**Process Lifecycle:**
+1. Parent process calls `accept()` to wait for incoming connections
+2. When connection arrives, parent calls `fork()` to spawn child process
+3. Child process inherits open client socket via copy-on-write semantics
+4. Child closes server socket descriptor (only parent listens)
+5. Child runs `handleClient()` to process HTTP requests on that connection
+6. Child exits when client closes connection
+7. Parent continues loop; returns to `accept()` to wait for next connection
+8. Zombie processes reaped by `SIGCHLD` handler using `waitpid(-1, NULL, WNOHANG)`
+
+**Concurrency Model:**
+- **Process Isolation**: Each client runs in isolated process; memory, file descriptors, and state are separate
+- **No Shared State**: Processes don't share buffers or data (no synchronization needed)
+- **Copy-on-Write**: Parent and child share memory pages until written (efficient fork)
+- **Simple Cleanup**: Child process exit automatically closes client socket and frees memory
+- **Scalability Limit**: Limited by OS process limits (typically 10K-100K processes)
+
+**Comparison to v0.2:**
+- v0.2: Single process, one client at a time, sequential connections
+- v0.3: Multiple processes, many concurrent clients, parallel handling
 
 ## Protocol Support
 
@@ -133,24 +173,22 @@ curl -H "Connection: close" http://localhost:8080/
 ## Limitations & Known Issues
 
 ### Current Limitations
-- **Single connection only**: Server handles one connection at a time and exits after it closes
-- **No concurrency**: No threading or process forking
-- **Limited routes**: Only 2 endpoints (/ and /echo)
-- **No static files**: Cannot serve HTML, CSS, JS, or other files
-- **No timeouts**: Connections can hang indefinitely
-- **Hardcoded port**: Always uses port 8080
-- **No logging**: Minimal debug output only
+- **Process Overhead**: Each connection spawns a new process (more memory per client than threads)
+- **No Async I/O**: Process blocks on socket reads (not a concern with separate processes)
+- **Limited Routes**: Only 2 endpoints (/ and /echo)
+- **No Static Files**: Cannot serve HTML, CSS, JS, or other files
+- **No Timeouts**: Connections can hang indefinitely (10-second socket read timeout exists)
+- **Hardcoded Port**: Always uses port 8080
+- **No Logging**: Minimal debug output only
+- **No Thread Pool**: Creates new process per connection (suitable for moderate concurrency, not high C10K workloads)
+
+### Fixed in v0.3
+- ✅ **Concurrent Connections**: Server now handles multiple clients simultaneously via `fork()`
+- ✅ **Zombie Processes**: Prevented with `SIGCHLD` handler reaping children
 
 See individual component documentation for detailed limitations and assumptions.
 
 ## Future Goals
-### v0.3 — Multi-Connection via fork()
-- Primary concept: process-based concurrency
-- Parent process accepts connections
-- Child process handles exactly one client
-- Clear separation of responsibilities
-- Learn process isolation, lifecycle, and cost
-
 ### v0.4 — Static File Serving
 - Primary concept: filesystem + HTTP interaction
 - Serve files from a document root
@@ -159,16 +197,15 @@ See individual component documentation for detailed limitations and assumptions.
 - Efficient file streaming
 
 ### Long-term Goals
-- Multi-threading for concurrent connections
 - Configurable ports and settings
 - Comprehensive logging system
 - Chunked transfer encoding
 - Additional HTTP methods (HEAD, PUT, DELETE, OPTIONS)
 - HTTP compression support
-- Performance optimizations (zero-copy I/O, buffer pooling)
+- Performance optimizations (buffer pooling, zero-copy I/O)
 
 ## Code Attribution
 
 All of the C code till now is written by **Aryan Singh Thakur** only. The documentation is written with the help of AI.
 
-Each version exists to teach one systems concept.
+Each version exists to teach one systems concept. See [docs/CHANGELOG.md](docs/CHANGELOG.md) for detailed release notes and feature history.
