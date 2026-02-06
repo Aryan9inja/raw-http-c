@@ -4,6 +4,13 @@
 
 `handlers.c` implements request routing, response generation, and transmission for the HTTP/1.1 server. It receives parsed requests from `httpParser.c`, matches them to appropriate handlers, generates responses with correct status codes and headers, and transmits responses back to clients.
 
+### v0.3 Status
+The request handlers are **unchanged from v0.2**. The architecture works seamlessly in the multi-process model:
+- Each child process calls `requestHandler()` independently for its requests
+- Response generation is stateless (no shared response pools or caches)
+- Socket transmission is per-connection (each child process has its own client socket)
+- No concurrency issues (process isolation eliminates data races)
+
 ## Key Responsibilities
 
 1. **Request Routing**: Match HTTP method and path to handler functions

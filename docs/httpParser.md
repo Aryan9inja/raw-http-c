@@ -4,6 +4,13 @@
 
 `httpParser.c` implements HTTP/1.1 request parsing with a zero-copy design. It extracts request lines, headers, and body boundaries from raw TCP buffers without allocating memory, returning non-owning views (`bufferView_t`) into the caller's buffer.
 
+### v0.3 Status
+The HTTP parser is **unchanged from v0.2**. The zero-copy design works identically in the multi-process model:
+- Each child process runs the parser independently on its client connection
+- Parser state is process-local (no shared state issues)
+- Buffer views remain valid within each child's buffer (no inter-process concerns)
+- No synchronization needed (process isolation provides it automatically)
+
 ## Design Philosophy
 
 ### Zero-Copy Parsing
