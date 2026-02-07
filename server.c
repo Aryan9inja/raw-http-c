@@ -166,7 +166,7 @@ void handleClient(int new_socket) {
             sendResponse(new_socket, &response);
             if (response.shouldClose == 1) goto cleanup;
 
-            printf("Response sent");
+            printf("Response sent\n");
 
             parseOffset += totalRequestSize;
         }

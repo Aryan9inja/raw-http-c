@@ -16,60 +16,101 @@ response_t initializeResponse() {
     return response;
 }
 
+
+void apiHandler(response_t* response, httpInfo_t* httpInfo, apiRoutes_t route) {
+    switch (route) {
+    case ROUTE_ROOT:
+        response->statusCode = 200;
+        response->statusText = "OK";
+        response->bodyLen = 5;
+        response->body = malloc(response->bodyLen);
+        if (!response->body) {
+            perror("Malloc failed");
+            response->statusCode = 500;
+            response->statusText = "Internal Server Error";
+            response->bodyLen = 0;
+            return;
+        }
+        memcpy(response->body, "Hello", response->bodyLen);
+        break;
+
+    case ROUTE_ECHO:
+        response->statusCode = 200;
+        response->statusText = "OK";
+        response->bodyLen = httpInfo->body.len;
+        response->body = malloc(response->bodyLen);
+        if (!response->body) {
+            perror("Malloc failed");
+            response->statusCode = 500;
+            response->statusText = "Internal Server Error";
+            response->bodyLen = 0;
+            return;
+        }
+        memcpy(response->body, httpInfo->body.data, response->bodyLen);
+        break;
+
+    case ROUTE_UNKNOWN_METHOD:
+        response->statusCode = 405;
+        response->statusText = "Method Not Allowed";
+        response->bodyLen = 44;
+        response->body = malloc(response->bodyLen);
+        if (!response->body) {
+            perror("Malloc failed");
+            response->statusCode = 500;
+            response->statusText = "Internal Server Error";
+            response->bodyLen = 0;
+            return;
+        }
+        memcpy(response->body, "This request method is currently unsupported", response->bodyLen);
+        break;
+
+    default:
+        response->statusCode = 404;
+        response->statusText = "Not Found";
+        response->bodyLen = 15;
+        response->body = malloc(response->bodyLen);
+        if (!response->body) {
+            perror("Malloc failed");
+            response->statusCode = 500;
+            response->statusText = "Internal Server Error";
+            response->bodyLen = 0;
+            return;
+        }
+        memcpy(response->body, "Route Not Found", response->bodyLen);
+        break;
+    }
+}
+
 response_t requestHandler(httpInfo_t* httpInfo) {
     response_t response = initializeResponse();
+    if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
 
-    // Handle GET requests
-    if (httpInfo->method.len == 3 && strncmp(httpInfo->method.data, "GET", httpInfo->method.len) == 0) {
-        // Route: GET /
-        if (httpInfo->path.len == 1 && strncmp(httpInfo->path.data, "/", httpInfo->path.len) == 0) {
-            response.statusCode = 200;
-            response.statusText = "OK";
-            response.bodyLen = 5;
-            response.body = malloc(response.bodyLen);
-            if (!response.body) {
-                response.statusCode = 500;
-                response.statusText = "Internal Server Error";
-                response.bodyLen = 0;
-                return response;
+    // isApi flag handles /api routes
+    if (httpInfo->isApi) {
+        // Handle GET requests
+        if (httpInfo->method.len == 3 && strncmp(httpInfo->method.data, "GET", httpInfo->method.len) == 0) {
+            // Route: GET /
+            if (httpInfo->path.len == 1 && strncmp(httpInfo->path.data, "/", httpInfo->path.len) == 0) {
+                apiHandler(&response, httpInfo, ROUTE_ROOT);
             }
-            memcpy(response.body, "Hello", response.bodyLen);
-            if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
+            else {
+                apiHandler(&response, httpInfo, ROUTE_NOT_FOUND);
+            }
+        }
+        // Handle POST requests
+        else if (httpInfo->method.len == 4 && strncmp(httpInfo->method.data, "POST", httpInfo->method.len) == 0) {
+            // Route: POST /echo - echoes back the request body
+            if (httpInfo->path.len == 5 && strncmp(httpInfo->path.data, "/echo", httpInfo->path.len) == 0) {
+                apiHandler(&response, httpInfo, ROUTE_ECHO);
+            }
+            else {
+                apiHandler(&response, httpInfo, ROUTE_NOT_FOUND);
+            }
         }
         else {
-            response.statusCode = 404;
-            response.statusText = "Not Found";
-            if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
+            // Unsupported HTTP method
+            apiHandler(&response, httpInfo, ROUTE_UNKNOWN_METHOD);
         }
-    }
-    // Handle POST requests
-    else if (httpInfo->method.len == 4 && strncmp(httpInfo->method.data, "POST", httpInfo->method.len) == 0) {
-        // Route: POST /echo - echoes back the request body
-        if (httpInfo->path.len == 5 && strncmp(httpInfo->path.data, "/echo", httpInfo->path.len) == 0) {
-            response.statusCode = 200;
-            response.statusText = "OK";
-            response.bodyLen = httpInfo->body.len;
-            response.body = malloc(response.bodyLen);
-            if (!response.body) {
-                response.statusCode = 500;
-                response.statusText = "Internal Server Error";
-                response.bodyLen = 0;
-                return response;
-            }
-            memcpy(response.body, httpInfo->body.data, response.bodyLen);
-            if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
-        }
-        else {
-            response.statusCode = 404;
-            response.statusText = "Not Found";
-            if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
-        }
-    }
-    else {
-        // Unsupported HTTP method
-        response.statusCode = 405;
-        response.statusText = "Method Not Allowed";
-        if (httpInfo->isKeepAlive == 0) response.shouldClose = 1;
     }
 
     return response;
@@ -78,10 +119,10 @@ response_t requestHandler(httpInfo_t* httpInfo) {
 requestResponse_t sendResponse(int socket, response_t* response) {
     char* responseBuffer = malloc(RESPONSE_BUFFER_SIZE);
     size_t responseLen = 0;
-    
+
     // Determine connection header value
     char* connectionString = response->shouldClose ? "close" : "keep-alive";
-    
+
     // Build HTTP response headers
     size_t headerLen = snprintf(responseBuffer, RESPONSE_BUFFER_SIZE,
         "HTTP/1.1 %d %s\r\n"
@@ -100,7 +141,7 @@ requestResponse_t sendResponse(int socket, response_t* response) {
 
     // Send response to client
     send(socket, responseBuffer, responseLen, 0);
-    
+
     // Free allocated memory
     if (response->bodyLen > 0) {
         free(response->body);

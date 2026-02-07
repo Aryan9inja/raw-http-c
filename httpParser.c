@@ -37,7 +37,22 @@ httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo) {
     httpInfo->isContentLengthSeen = 0;
     httpInfo->isKeepAlive = 1;
     httpInfo->headerCnt = 0;
+    httpInfo->isApi=0;
     return httpInfo;
+}
+
+void checkIfApi(httpInfo_t* httpInfo){
+    size_t pathLength=httpInfo->path.len;
+    char* pathStart=httpInfo->path.data;
+    if(pathLength>=5 && strncmp(pathStart,"/api/",5)==0){
+        httpInfo->isApi=1;
+        httpInfo->path.data=pathStart+4;
+        httpInfo->path.len=pathLength-4;
+    }
+    else if(pathLength==4 && strncmp(pathStart,"/api",4)==0){
+        httpInfo->isApi=1;
+        httpInfo->path.len=1;
+    }
 }
 
 parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo) {
@@ -175,6 +190,8 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
         printf("The content length is %zu\n", httpInfo->contentLength);
         return BODY_NOT_ALLOWED;
     }
+
+    checkIfApi(httpInfo);
 
     return OK;
 }

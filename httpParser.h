@@ -9,7 +9,7 @@
  * len: Length of the buffer view
  */
 typedef struct {
-    const char* data;
+    char* data;
     size_t len;
 }bufferView_t;
 
@@ -33,6 +33,7 @@ typedef struct {
  * isContentLengthSeen: Flag indicating if Content-Length was present
  * body: Request body data
  * isKeepAlive: Flag for persistent connection (1=keep-alive, 0=close)
+ * isApi: To check if the request is api or file request
  */
 typedef struct {
     bufferView_t method;
@@ -45,6 +46,7 @@ typedef struct {
     int isContentLengthSeen;
     bufferView_t body;
     int isKeepAlive;
+    int isApi;
 }httpInfo_t;
 
 /**

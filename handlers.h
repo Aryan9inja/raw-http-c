@@ -40,6 +40,16 @@ typedef enum {
 }requestResponse_t;
 
 /**
+ * Enum for api routes
+ */
+typedef enum{
+    ROUTE_ROOT,
+    ROUTE_ECHO,
+    ROUTE_NOT_FOUND,
+    ROUTE_UNKNOWN_METHOD,
+}apiRoutes_t;
+
+/**
  * Handles incoming HTTP requests and generates appropriate responses
  * @param httpInfo Pointer to parsed HTTP request information
  * @return response_t structure containing the HTTP response
