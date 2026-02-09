@@ -36,7 +36,8 @@ error_entry_t error_table[] = {
     {HEADER_TOO_LARGE,431,"Request Header Fields Too Large"},
     {TOO_MANY_HEADERS,400,"Too Many Headers"},
     {PAYLOAD_TOO_LARGE,413,"Payload Too Large"},
-    {REQUEST_TIMEOUT,408,"Request Timeout"}
+    {REQUEST_TIMEOUT,408,"Request Timeout"},
+    {BAD_REQUEST_PATH,400,"Bad Path For Request"}
 };
 
 // Handle parser errors by sending appropriate HTTP error response
@@ -87,6 +88,8 @@ void handleClient(int new_socket) {
     size_t readOffset = 0;
     size_t parseOffset = 0;
     char* headerEnd = NULL;
+    char* decodedPath = NULL;
+    char* normalizedPath = NULL;
 
     // Main loop: read data from client
     while (1) {
@@ -159,14 +162,47 @@ void handleClient(int new_socket) {
                 handleParseError(parseResult, new_socket);
                 goto cleanup;
             }
+
+            // Decode and normalize Url before sending to response generation
+            decodedPath = malloc(httpInfo.path.len);
+            if (!decodedPath) {
+                perror("Malloc failed");
+                goto cleanup;
+            }
+            httpInfo.decodedPath.data = decodedPath;
+            parseResult = decodeUrl(&httpInfo.path, &httpInfo.decodedPath);
+            if (parseResult != OK) {
+                handleParseError(parseResult, new_socket);
+                goto cleanup;
+            }
+
+            normalizedPath = malloc(httpInfo.decodedPath.len);
+            if (!normalizedPath) {
+                perror("Malloc failed");
+                goto cleanup;
+            }
+            httpInfo.normalizedPath.data = normalizePath;
+            parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
+            if (parseResult != OK) {
+                handleParseError(parseResult, new_socket);
+                goto cleanup;
+            }
+
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
             // Generate and send response
+            // Will send decoded path after normalization is complete, first I will work on normalization
             response_t response = requestHandler(&httpInfo);
             sendResponse(new_socket, &response);
             if (response.shouldClose == 1) goto cleanup;
 
             printf("Response sent\n");
+
+            // Free decoded and normalized path before new request
+            free(decodedPath);
+            decodedPath = NULL;
+            free(normalizedPath);
+            normalizedPath = NULL;
 
             parseOffset += totalRequestSize;
         }
@@ -182,6 +218,8 @@ void handleClient(int new_socket) {
 
 cleanup:
     // Clean up and close connections
+    free(normalizedPath);
+    free(decodedPath);
     free(headerArray);
     free(buffer);
     close(new_socket);

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "httpParser.h"
 
 // Custom strstr that respects a maximum length instead of relying on null-terminator
@@ -37,27 +38,28 @@ httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo) {
     httpInfo->isContentLengthSeen = 0;
     httpInfo->isKeepAlive = 1;
     httpInfo->headerCnt = 0;
-    httpInfo->isApi=0;
+    httpInfo->isApi = 0;
+    httpInfo->decodedPath.len = 0;
     return httpInfo;
 }
 
-void checkIfApi(httpInfo_t* httpInfo){
-    size_t pathLength=httpInfo->path.len;
-    char* pathStart=httpInfo->path.data;
-    if(pathLength>=5 && strncmp(pathStart,"/api/",5)==0){
-        httpInfo->isApi=1;
-        httpInfo->path.data=pathStart+4;
-        httpInfo->path.len=pathLength-4;
+void checkIfApi(httpInfo_t* httpInfo) {
+    size_t pathLength = httpInfo->path.len;
+    char* pathStart = httpInfo->path.data;
+    if (pathLength >= 5 && strncmp(pathStart, "/api/", 5) == 0) {
+        httpInfo->isApi = 1;
+        httpInfo->path.data = pathStart + 4;
+        httpInfo->path.len = pathLength - 4;
     }
-    else if(pathLength==4 && strncmp(pathStart,"/api",4)==0){
-        httpInfo->isApi=1;
-        httpInfo->path.len=1;
+    else if (pathLength == 4 && strncmp(pathStart, "/api", 4) == 0) {
+        httpInfo->isApi = 1;
+        httpInfo->path.len = 1;
     }
 }
 
 parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo) {
     httpInfo_t* httpInfo = initializeHttpInfo(uninitializedHttpInfo);
-    
+
     // Find the end of the first line (request line)
     char* firstLineEnd = strstr(buffer, "\r\n");
     if (!firstLineEnd) {
@@ -113,7 +115,7 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
     }
     size_t headerCnt = 0;
     httpInfo->headers = headerArray;
-    
+
     // Parse each header line until we hit the empty line
     while (headerStart < headerEnd) {
         size_t remaining = headerEnd - headerStart;
@@ -200,5 +202,106 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
 parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo) {
     httpInfo->body.data = bodyStart;
     httpInfo->body.len = httpInfo->contentLength;
+    return OK;
+}
+
+parserResult_t decodeUrl(bufferView_t* requestPath, bufferView_t* decodedPath) {
+    size_t pathSize = requestPath->len;
+    char* pathPointer = requestPath->data;
+
+    for (size_t i = 0;i < pathSize;i++, decodedPath->len++) {
+        // Ending with % or %H like
+        if (pathPointer[i] == '%') {
+            if (i + 2 >= pathSize) {
+                return BAD_REQUEST_PATH;
+            }
+            // 
+            else if (!isxdigit(pathPointer[i + 1]) || !isxdigit(pathPointer[i + 2])) {
+                return BAD_REQUEST_PATH;
+            }
+            else {
+                int high = isdigit(pathPointer[i + 1]) ? pathPointer[i + 1] - '0'
+                    : toupper(pathPointer[i + 1]) - 'A' + 10;
+                int low = isdigit(pathPointer[i + 2]) ? pathPointer[i + 2] - '0'
+                    : toupper(pathPointer[i + 2]) - 'A' + 10;
+
+                if (decodedPath->len >= requestPath->len) {
+                    return BAD_REQUEST_PATH; // overflow guard
+                }
+
+                char converted = (char)(high * 16 + low);
+                decodedPath->data[decodedPath->len] = converted;
+                i += 2;
+            }
+        }
+        else {
+            decodedPath->data[decodedPath->len] = pathPointer[i];
+        }
+    }
+    return OK;
+}
+
+parserResult_t normalizePath(bufferView_t* decodedPath, bufferView_t* normalizedPath) {
+    char* root = normalizedPath->data;
+    *root = '/';
+
+    char* out = root + 1;                 // stack pointer
+    char* src = decodedPath->data;
+    char* end = decodedPath->data + decodedPath->len;
+    char* out_end = normalizedPath->data + normalizedPath->len;
+
+    while (src < end) {
+
+        // Skip redundant slashes
+        if (*src == '/') {
+            src++;
+            continue;
+        }
+
+        // Extract segment
+        char* seg_start = src;
+        while (src < end && *src != '/') {
+            src++;
+        }
+        size_t seg_len = src - seg_start;
+
+        // Ignore "."
+        if (seg_len == 1 && seg_start[0] == '.') {
+            continue;
+        }
+
+        // Handle ".."
+        if (seg_len == 2 && seg_start[0] == '.' && seg_start[1] == '.') {
+            if (out <= root + 1) {
+                // Attempt to escape root
+                return BAD_REQUEST_PATH;
+            }
+
+            // Pop previous segment
+            out--;
+            while (out > root + 1 && *(out - 1) != '/') {
+                out--;
+            }
+            continue;
+        }
+
+        // Normal segment — push
+        if (out > root + 1) {
+            if (out + 1 >= out_end) {
+                return BAD_REQUEST_PATH;
+            }
+            *out++ = '/';
+        }
+
+        if (out + seg_len >= out_end) {
+            return BAD_REQUEST_PATH;
+        }
+
+        memcpy(out, seg_start, seg_len);
+        out += seg_len;
+    }
+
+    // Finalize
+    normalizedPath->len = out - normalizedPath->data;
     return OK;
 }

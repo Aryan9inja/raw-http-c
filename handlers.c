@@ -111,6 +111,8 @@ response_t requestHandler(httpInfo_t* httpInfo) {
             // Unsupported HTTP method
             apiHandler(&response, httpInfo, ROUTE_UNKNOWN_METHOD);
         }
+    }else{
+        // Handle static files
     }
 
     return response;
