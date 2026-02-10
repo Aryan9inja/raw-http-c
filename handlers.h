@@ -52,9 +52,10 @@ typedef enum{
 /**
  * Handles incoming HTTP requests and generates appropriate responses
  * @param httpInfo Pointer to parsed HTTP request information
+ * @param root_fd File descriptor for static file root folder
  * @return response_t structure containing the HTTP response
  */
-response_t requestHandler(httpInfo_t* httpInfo);
+response_t requestHandler(httpInfo_t* httpInfo, int root_fd);
 
 /**
  * Sends an HTTP response through a socket

@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <fcntl.h>
 #include "httpParser.h"
 #include "handlers.h"
 
@@ -72,7 +73,7 @@ void burnZombies(int s) {
     errno = saved_errno;
 }
 
-void handleClient(int new_socket) {
+void handleClient(int new_socket, int docroot_fd) {
     // Allocate buffer for reading HTTP requests
     size_t bufferSize = BUFFER_SIZE;
     char* buffer = malloc(bufferSize);
@@ -192,7 +193,7 @@ void handleClient(int new_socket) {
 
             // Generate and send response
             // Will send decoded path after normalization is complete, first I will work on normalization
-            response_t response = requestHandler(&httpInfo);
+            response_t response = requestHandler(&httpInfo, docroot_fd);
             sendResponse(new_socket, &response);
             if (response.shouldClose == 1) goto cleanup;
 
@@ -227,7 +228,7 @@ cleanup:
 }
 
 int main() {
-    int server_fd, new_socket;
+    int server_fd, new_socket, docroot_fd;
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
     int opt = 1;
@@ -239,6 +240,12 @@ int main() {
     sa.sa_handler = burnZombies;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
+
+    // Open file descriptor to server_file_root folder
+    if(docroot_fd = open("public", O_RDONLY | O_DIRECTORY)==-1){
+        perror("open failed");
+        exit(EXIT_FAILURE);
+    }
 
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
         perror("sigaction");
@@ -296,7 +303,7 @@ int main() {
             // Child process will handle the client
             // It does not care about server file descriptor
             close(server_fd);
-            handleClient(new_socket);
+            handleClient(new_socket, docroot_fd);
         }
         else {
             // Parent process will listen for new connections
