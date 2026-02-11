@@ -182,7 +182,7 @@ void handleClient(int new_socket, int docroot_fd) {
                 perror("Malloc failed");
                 goto cleanup;
             }
-            httpInfo.normalizedPath.data = normalizePath;
+            httpInfo.normalizedPath.data = normalizedPath;
             parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
             if (parseResult != OK) {
                 handleParseError(parseResult, new_socket);
@@ -242,7 +242,7 @@ int main() {
     sa.sa_flags = SA_RESTART;
 
     // Open file descriptor to server_file_root folder
-    if(docroot_fd = open("public", O_RDONLY | O_DIRECTORY)==-1){
+    if((docroot_fd = open("public", O_RDONLY | O_DIRECTORY))==-1){
         perror("open failed");
         exit(EXIT_FAILURE);
     }

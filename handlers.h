@@ -30,13 +30,17 @@ typedef struct{
     char* body;
     size_t bodyLen;
     int shouldClose;
+    int fileDescriptor;
+    size_t fileSize;
 }response_t;
 
 /**
  * Enum for request response status
  */
 typedef enum {
-    Ok
+    Ok,
+    FILE_SEND_ERROR,
+    INTERNAL_SERVER_ERROR
 }requestResponse_t;
 
 /**

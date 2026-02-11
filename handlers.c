@@ -5,16 +5,21 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <stdio.h>
+#include <errno.h>
 
 #define RESPONSE_BUFFER_SIZE 16384
+#define SEND_FILE_MAX_LIMIT 8196
 
 // Initialize a response structure with default values
 response_t initializeResponse() {
     response_t response = {
         .bodyLen = 0,
         .body = NULL,
-        .shouldClose = 0
+        .shouldClose = 0,
+        .fileSize = 0,
+        .fileDescriptor = -1
     };
     return response;
 }
@@ -94,32 +99,36 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
         return;
     }
     // Copy after striping '/';
-    memcpy(relativePath, httpInfo->normalizedPath.data[1], httpInfo->normalizedPath.len - 1);
+    memcpy(relativePath, httpInfo->normalizedPath.data + 1, httpInfo->normalizedPath.len - 1);
     // Add null terminator at end
     relativePath[httpInfo->normalizedPath.len - 1] = '\0';
 
     // Check for empty path
-    if (strlen(relativePath) <= 0) {
-        response->statusCode = 403;
-        response->statusText = "Forbidden";
-        response->bodyLen = 20;
-        response->body = malloc(response->bodyLen);
-        if (!response->body) {
-            perror("Malloc failed");
+    // if empty serve index file
+    if (strlen(relativePath) == 0) {
+        char* temp = realloc(relativePath, 11);
+        if (temp == NULL) {
+            perror("Realloc failed");
+            free(relativePath);
             setInternalServerError(response);
             return;
         }
-        memcpy(response->body, "Forbidden file route", response->bodyLen);
+        relativePath = temp;
+        memcpy(relativePath, "index.html", 11);
     }
 
-    if (staticFile_fd = openat(root_fd, relativePath, O_RDONLY) == -1) {
+    if ((staticFile_fd = openat(root_fd, relativePath, O_RDONLY)) == -1) {
         perror("OpenAt failed");
+        free(relativePath);
         setInternalServerError(response);
         return;
     }
 
+    free(relativePath);
+
     if (fstat(staticFile_fd, &fileStat) == -1) {
         perror("fstat failed");
+        close(staticFile_fd);
         setInternalServerError(response);
         return;
     }
@@ -136,10 +145,13 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
             return;
         }
         memcpy(response->body, "Forbidden file route", response->bodyLen);
+        return;
     }
 
-    // Complete after this 
-    // Tilted GG
+    response->statusCode = 200;
+    response->statusText = "OK";
+    response->fileSize = fileStat.st_size;
+    response->fileDescriptor = staticFile_fd;
 }
 
 response_t requestHandler(httpInfo_t* httpInfo, int root_fd) {
@@ -189,36 +201,88 @@ response_t requestHandler(httpInfo_t* httpInfo, int root_fd) {
     return response;
 }
 
-requestResponse_t sendResponse(int socket, response_t* response) {
-    char* responseBuffer = malloc(RESPONSE_BUFFER_SIZE);
-    size_t responseLen = 0;
-
-    // Determine connection header value
+requestResponse_t sendHeaders(int socket, response_t* response, char* responseBuffer) {
     char* connectionString = response->shouldClose ? "close" : "keep-alive";
+    size_t contentLength = response->fileDescriptor != -1 ? response->fileSize : response->bodyLen;
 
     // Build HTTP response headers
     size_t headerLen = snprintf(responseBuffer, RESPONSE_BUFFER_SIZE,
         "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n\r\n",
-        response->statusCode, response->statusText, response->bodyLen, connectionString);
+        response->statusCode, response->statusText, contentLength, connectionString);
 
-    // Append body if present and fits in buffer
-    if (response->bodyLen > 0 && (headerLen + response->bodyLen) < RESPONSE_BUFFER_SIZE) {
-        memcpy(responseBuffer + headerLen, response->body, response->bodyLen);
-        responseLen = headerLen + response->bodyLen;
+    send(socket, responseBuffer, headerLen, 0);
+    return Ok;
+}
+
+requestResponse_t sendBody(int socket, response_t* response, char* responseBuffer) {
+    memcpy(responseBuffer, response->body, response->bodyLen);
+    size_t responseLen = response->bodyLen;
+
+    send(socket, responseBuffer, responseLen, 0);
+    return Ok;
+}
+
+requestResponse_t sendFileStream(int socket, response_t* response) {
+    off_t offset = 0;
+    size_t remainingFileSize = response->fileSize;
+    while (remainingFileSize > 0) {
+        size_t byteCount = SEND_FILE_MAX_LIMIT > remainingFileSize ?
+            remainingFileSize : SEND_FILE_MAX_LIMIT;
+        ssize_t sent = sendfile(socket, response->fileDescriptor, &offset, byteCount);
+
+        if (sent <= 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            return FILE_SEND_ERROR;
+        }
+
+        remainingFileSize -= sent;
+    }
+    return Ok;
+}
+
+requestResponse_t sendResponse(int socket, response_t* response) {
+    char* responseBuffer = NULL;
+    responseBuffer = malloc(RESPONSE_BUFFER_SIZE);
+    if (!responseBuffer) {
+        perror("Malloc failed");
+        return INTERNAL_SERVER_ERROR;
+    }
+
+    requestResponse_t headerResult = sendHeaders(socket, response, responseBuffer);
+    if (headerResult != Ok) {
+        fprintf(stdout, "Header sending failed");
+        goto cleanup;
+    }
+
+    if (response->fileDescriptor != -1) {
+        requestResponse_t fileResult = sendFileStream(socket, response);
+        if (fileResult != Ok) {
+            fprintf(stdout, "File sending failed");
+            goto cleanup;
+        }
     }
     else {
-        responseLen = headerLen;
+        requestResponse_t bodyResult = sendBody(socket, response, responseBuffer);
+        if (bodyResult != Ok) {
+            fprintf(stdout, "Body sending failed");
+            goto cleanup;
+        }
     }
 
-    // Send response to client
-    send(socket, responseBuffer, responseLen, 0);
-
-    // Free allocated memory
+cleanup:
+    if (response->fileDescriptor != -1) {
+        close(response->fileDescriptor);
+    }
     if (response->bodyLen > 0) {
         free(response->body);
     }
     free(responseBuffer);
+
     return Ok;
 }
+
+// TODO : Implement send loop
+// TODO : Remove SEND_FILE_MAX_LIMIT
+// TODO : Handle errors better
