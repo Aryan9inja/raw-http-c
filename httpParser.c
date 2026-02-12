@@ -104,8 +104,15 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
     size_t versionLength = firstLineEnd - versionStart;
     httpInfo->version.data = versionStart;
     httpInfo->version.len = versionLength;
-    if (strncmp(versionStart, "HTTP/1.1", versionLength) != 0) {
+    // Added HTTP/1.0 specially because of apache benchmark compatibility
+    if (strncmp(versionStart, "HTTP/1.1", 8) != 0 &&
+        strncmp(versionStart, "HTTP/1.0", 8) != 0) {
         return INVALID_VERSION;
+    }
+
+    // HTTP/1.0 is not reliable for keep alive 
+    if(strncmp(versionStart, "HTTP/1.0", 8) == 0){
+        httpInfo->isKeepAlive=0;
     }
 
     // ---- Parsing Headers ----
@@ -194,7 +201,6 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
     }
 
     checkIfApi(httpInfo);
-
     return OK;
 }
 
@@ -287,13 +293,13 @@ parserResult_t normalizePath(bufferView_t* decodedPath, bufferView_t* normalized
 
         // Normal segment — push
         if (out > root + 1) {
-            if (out + 1 >= out_end) {
+            if (out + 1 > out_end) {
                 return BAD_REQUEST_PATH;
             }
             *out++ = '/';
         }
 
-        if (out + seg_len >= out_end) {
+        if (out + seg_len > out_end) {
             return BAD_REQUEST_PATH;
         }
 

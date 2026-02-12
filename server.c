@@ -171,6 +171,7 @@ void handleClient(int new_socket, int docroot_fd) {
                 goto cleanup;
             }
             httpInfo.decodedPath.data = decodedPath;
+            httpInfo.decodedPath.len = 0;
             parseResult = decodeUrl(&httpInfo.path, &httpInfo.decodedPath);
             if (parseResult != OK) {
                 handleParseError(parseResult, new_socket);
@@ -183,7 +184,9 @@ void handleClient(int new_socket, int docroot_fd) {
                 goto cleanup;
             }
             httpInfo.normalizedPath.data = normalizedPath;
+            httpInfo.normalizedPath.len = httpInfo.decodedPath.len;
             parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
+
             if (parseResult != OK) {
                 handleParseError(parseResult, new_socket);
                 goto cleanup;
@@ -242,7 +245,7 @@ int main() {
     sa.sa_flags = SA_RESTART;
 
     // Open file descriptor to server_file_root folder
-    if((docroot_fd = open("public", O_RDONLY | O_DIRECTORY))==-1){
+    if ((docroot_fd = open("public", O_RDONLY | O_DIRECTORY)) == -1) {
         perror("open failed");
         exit(EXIT_FAILURE);
     }

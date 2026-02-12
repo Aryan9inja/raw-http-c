@@ -32,6 +32,7 @@ typedef struct{
     int shouldClose;
     int fileDescriptor;
     size_t fileSize;
+    char* contentType;
 }response_t;
 
 /**
@@ -40,7 +41,9 @@ typedef struct{
 typedef enum {
     Ok,
     FILE_SEND_ERROR,
-    INTERNAL_SERVER_ERROR
+    INTERNAL_SERVER_ERROR,
+    HEADER_SEND_ERROR,
+    BODY_SEND_ERROR
 }requestResponse_t;
 
 /**

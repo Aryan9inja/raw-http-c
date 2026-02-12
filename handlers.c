@@ -10,7 +10,6 @@
 #include <errno.h>
 
 #define RESPONSE_BUFFER_SIZE 16384
-#define SEND_FILE_MAX_LIMIT 8196
 
 // Initialize a response structure with default values
 response_t initializeResponse() {
@@ -19,9 +18,30 @@ response_t initializeResponse() {
         .body = NULL,
         .shouldClose = 0,
         .fileSize = 0,
-        .fileDescriptor = -1
+        .fileDescriptor = -1,
+        .contentType = "text/plain"
     };
     return response;
+}
+
+void getFileType(char* relativePath, response_t* response) {
+    // Find the last dot in the string
+    char* dot = strrchr(relativePath, '.');
+
+    // If no dot is found or it's the last character
+    if (!dot || dot == relativePath + strlen(relativePath) - 1) {
+        response->contentType = "application/octet-stream"; // Default
+        return;
+    }
+
+    char* ext = dot + 1; // Move past the '.'
+
+    // Compare and assign
+    if (strcmp(ext, "html") == 0) response->contentType = "text/html";
+    else if (strcmp(ext, "css") == 0) response->contentType = "text/css";
+    else if (strcmp(ext, "js") == 0)  response->contentType = "application/javascript";
+    else if (strcmp(ext, "png") == 0) response->contentType = "image/png";
+    else response->contentType = "text/plain";
 }
 
 void setInternalServerError(response_t* response) {
@@ -30,7 +50,35 @@ void setInternalServerError(response_t* response) {
     response->bodyLen = 0;
 }
 
+void setNotFoundError(response_t* response) {
+    response->statusCode = 404;
+    response->statusText = "Not Found";
+    response->bodyLen = 15;
+    response->body = malloc(response->bodyLen);
+    if (!response->body) {
+        perror("Malloc failed");
+        setInternalServerError(response);
+        return;
+    }
+    memcpy(response->body, "Route Not Found", response->bodyLen);
+}
+
+void setForbiddenFileRoute(response_t* response) {
+    response->statusCode = 403;
+    response->statusText = "Forbidden";
+    response->bodyLen = 20;
+    response->body = malloc(response->bodyLen);
+    if (!response->body) {
+        perror("Malloc failed");
+        setInternalServerError(response);
+        return;
+    }
+    memcpy(response->body, "Forbidden file route", response->bodyLen);
+}
+
 void apiHandler(response_t* response, httpInfo_t* httpInfo, apiRoutes_t route) {
+    // For now stick to text/plain
+    response->contentType = "text/plain";
     switch (route) {
     case ROUTE_ROOT:
         response->statusCode = 200;
@@ -72,16 +120,7 @@ void apiHandler(response_t* response, httpInfo_t* httpInfo, apiRoutes_t route) {
         break;
 
     default:
-        response->statusCode = 404;
-        response->statusText = "Not Found";
-        response->bodyLen = 15;
-        response->body = malloc(response->bodyLen);
-        if (!response->body) {
-            perror("Malloc failed");
-            setInternalServerError(response);
-            return;
-        }
-        memcpy(response->body, "Route Not Found", response->bodyLen);
+        setNotFoundError(response);
         break;
     }
 }
@@ -120,10 +159,20 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
     if ((staticFile_fd = openat(root_fd, relativePath, O_RDONLY)) == -1) {
         perror("OpenAt failed");
         free(relativePath);
-        setInternalServerError(response);
+        if (errno == ENOENT || errno == ENOTDIR) {
+            setNotFoundError(response);
+        }
+        else if (errno == EACCES) {
+            setForbiddenFileRoute(response);
+        }
+        else {
+            setInternalServerError(response);
+        }
         return;
     }
 
+    printf("Serving file: %s\n", relativePath);
+    getFileType(relativePath, response);
     free(relativePath);
 
     if (fstat(staticFile_fd, &fileStat) == -1) {
@@ -135,16 +184,8 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
 
     // check if the stat is for directory or file
     if (S_ISREG(fileStat.st_mode) == 0) {
-        response->statusCode = 403;
-        response->statusText = "Forbidden";
-        response->bodyLen = 20;
-        response->body = malloc(response->bodyLen);
-        if (!response->body) {
-            perror("Malloc failed");
-            setInternalServerError(response);
-            return;
-        }
-        memcpy(response->body, "Forbidden file route", response->bodyLen);
+        close(staticFile_fd);
+        setForbiddenFileRoute(response);
         return;
     }
 
@@ -209,10 +250,22 @@ requestResponse_t sendHeaders(int socket, response_t* response, char* responseBu
     size_t headerLen = snprintf(responseBuffer, RESPONSE_BUFFER_SIZE,
         "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n"
+        "Content-Type: %s\r\n"
         "Connection: %s\r\n\r\n",
-        response->statusCode, response->statusText, contentLength, connectionString);
+        response->statusCode, response->statusText, contentLength, response->contentType, connectionString);
 
-    send(socket, responseBuffer, headerLen, 0);
+    size_t sentOffset = 0;
+    size_t remaining = headerLen;
+    while (remaining > 0) {
+        ssize_t bytesSent = send(socket, responseBuffer + sentOffset, remaining, 0);
+        if (bytesSent <= 0) {
+            if (errno == EINTR) continue;
+            return HEADER_SEND_ERROR;
+        }
+        remaining -= bytesSent;
+        sentOffset += bytesSent;
+    }
+
     return Ok;
 }
 
@@ -220,7 +273,17 @@ requestResponse_t sendBody(int socket, response_t* response, char* responseBuffe
     memcpy(responseBuffer, response->body, response->bodyLen);
     size_t responseLen = response->bodyLen;
 
-    send(socket, responseBuffer, responseLen, 0);
+    size_t sentOffset = 0;
+    size_t remaining = responseLen;
+    while (remaining > 0) {
+        ssize_t bytesSent = send(socket, responseBuffer + sentOffset, remaining, 0);
+        if (bytesSent <= 0) {
+            if (errno == EINTR) continue;
+            return BODY_SEND_ERROR;
+        }
+        remaining -= bytesSent;
+        sentOffset += bytesSent;
+    }
     return Ok;
 }
 
@@ -228,8 +291,7 @@ requestResponse_t sendFileStream(int socket, response_t* response) {
     off_t offset = 0;
     size_t remainingFileSize = response->fileSize;
     while (remainingFileSize > 0) {
-        size_t byteCount = SEND_FILE_MAX_LIMIT > remainingFileSize ?
-            remainingFileSize : SEND_FILE_MAX_LIMIT;
+        size_t byteCount = remainingFileSize;
         ssize_t sent = sendfile(socket, response->fileDescriptor, &offset, byteCount);
 
         if (sent <= 0) {
@@ -243,16 +305,13 @@ requestResponse_t sendFileStream(int socket, response_t* response) {
 }
 
 requestResponse_t sendResponse(int socket, response_t* response) {
-    char* responseBuffer = NULL;
-    responseBuffer = malloc(RESPONSE_BUFFER_SIZE);
-    if (!responseBuffer) {
-        perror("Malloc failed");
-        return INTERNAL_SERVER_ERROR;
-    }
+    requestResponse_t result = Ok;
+    char responseBuffer[RESPONSE_BUFFER_SIZE];
 
     requestResponse_t headerResult = sendHeaders(socket, response, responseBuffer);
     if (headerResult != Ok) {
         fprintf(stdout, "Header sending failed");
+        result = headerResult;
         goto cleanup;
     }
 
@@ -260,6 +319,7 @@ requestResponse_t sendResponse(int socket, response_t* response) {
         requestResponse_t fileResult = sendFileStream(socket, response);
         if (fileResult != Ok) {
             fprintf(stdout, "File sending failed");
+            result = fileResult;
             goto cleanup;
         }
     }
@@ -267,6 +327,7 @@ requestResponse_t sendResponse(int socket, response_t* response) {
         requestResponse_t bodyResult = sendBody(socket, response, responseBuffer);
         if (bodyResult != Ok) {
             fprintf(stdout, "Body sending failed");
+            result = bodyResult;
             goto cleanup;
         }
     }
@@ -278,11 +339,7 @@ cleanup:
     if (response->bodyLen > 0) {
         free(response->body);
     }
-    free(responseBuffer);
 
-    return Ok;
+    printf("%d",response->statusCode);
+    return result;
 }
-
-// TODO : Implement send loop
-// TODO : Remove SEND_FILE_MAX_LIMIT
-// TODO : Handle errors better
