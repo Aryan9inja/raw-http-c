@@ -2,40 +2,146 @@
 
 ## Overview
 
-`server.c` is the main entry point and orchestrator of the HTTP/1.1 server. It manages TCP socket operations, connection lifecycle, buffer management, and coordinates the request-response pipeline through the parser and handler components.
+`server.c` is the main entry point and orchestrator of the HTTP/1.1 server. It manages TCP socket operations, connection lifecycle, buffer management, document root file descriptor, and coordinates the request-response pipeline through the parser and handler components.
+
+### v0.4 Status
+Enhancements for **static file serving security** and **timeout protection**:
+- **Document Root FD**: Opens `public/` directory at startup, passed to all child processes
+- **Socket Timeout**: 10-second read timeout via `setsockopt(SO_RCVTIMEO)` 
+- **URL Processing**: Decodes and normalizes paths before routing to handlers
+- **Memory Management**: Allocates/frees `decodedPath` and `normalizedPath` buffers per request
+- Process model unchanged: Each child calls `handleClient()` independently
 
 ## Key Responsibilities
 
 1. **TCP Socket Setup**: Creates, binds, and listens on port 8080
-2. **Connection Acceptance**: Accepts incoming client connections
-3. **Buffer Management**: Dynamically allocates and manages per-connection buffers
-4. **Request Processing Loop**: Implements keep-alive connection handling with request pipelining
-5. **Error Handling**: Maps parser errors to HTTP status codes and generates error responses
-6. **Resource Cleanup**: Ensures proper cleanup of memory and socket descriptors
+2. **Document Root Setup** (v0.4): Opens `public/` directory descriptor for secure file access
+3. **Socket Timeout Configuration** (v0.4): Sets 10-second read timeout per connection
+4. **Connection Acceptance**: Accepts incoming client connections (parent process)
+5. **Process Spawning** (v0.3): Forks child process per connection
+6. **Buffer Management**: Dynamically allocates and manages per-connection buffers
+7. **URL Processing** (v0.4): Decodes and normalizes paths for security
+8. **Request Processing Loop**: Implements keep-alive connection handling with request pipelining
+9. **Error Handling**: Maps parser errors to HTTP status codes and generates error responses
+10. **Resource Cleanup**: Ensures proper cleanup of memory, file descriptors, and sockets
 
 ## Core Functions
 
 ### `handleParseError()`
 Maps parser error codes (`parserResult_t`) to appropriate HTTP status codes and sends error responses to the client.
 
-**Error Mapping:**
-- `BAD_REQUEST_LINE`, `BAD_HEADER_SYNTAX`, `INVALID_CONTENT_LENGTH`, etc. → 400 Bad Request
+**Error Mapping Table (v0.4 Updated):**
+- `BAD_REQUEST_LINE`, `BAD_HEADER_SYNTAX`, `INVALID_CONTENT_LENGTH` → 400 Bad Request
+- `BAD_REQUEST_PATH` (v0.4): Invalid URL encoding or path traversal → 400 Bad Request
 - `UNSUPPORTED_METHOD` → 405 Method Not Allowed
 - `HEADER_TOO_LARGE`, `TOO_MANY_HEADERS` → 431 Request Header Fields Too Large
 - `PAYLOAD_TOO_LARGE` → 413 Payload Too Large
+- `REQUEST_TIMEOUT` (v0.4): Socket read timeout → 408 Request Timeout
 - `UNSUPPORTED_TRANSFER_ENCODING` → 501 Not Implemented
-- Memory allocation failure → 500 Internal Server Error
+- `INVALID_VERSION` → 505 HTTP Version Not Supported
 
-### `main()`
-The main server loop that orchestrates all operations:
+**Response Format:**
+```
+HTTP/1.1 <status> <message>\r\n
+Content-Length: 0\r\n
+Connection: close\r\n\r\n
+```
+All error responses close the connection (no keep-alive).
 
-1. Socket initialization and binding
-2. Connection acceptance loop
-3. Per-connection request processing loop with keep-alive support
-4. Buffer management with dynamic reallocation
-5. Request parsing and handling
-6. Response transmission
-7. Cleanup and connection termination
+### `handleClient()` (v0.4 Updated)
+Main request processing function for each client connection (runs in child process).
+
+**Signature:**
+```c
+void handleClient(int new_socket, int docroot_fd);
+```
+
+**Parameters:**
+- `new_socket`: Client socket descriptor (inherited from parent via fork)
+- `docroot_fd`: File descriptor for `public/` directory (inherited from parent, v0.4)
+
+**Processing Steps:**
+1. **Timeout Configuration**: Set 10-second socket read timeout
+2. **Buffer Allocation**: Allocate initial 4KB buffer and header array
+3. **Request Loop**: Read → Parse → Decode URL → Normalize → Handle → Respond
+4. **Keep-Alive**: Continue loop or break based on `response.shouldClose`
+5. **Cleanup**: Free all buffers, close socket, exit child process
+
+**New in v0.4: URL Processing Per Request**
+```c
+// After successful header parsing:
+
+// 1. Allocate and decode URL
+decodedPath = malloc(httpInfo.path.len);
+httpInfo.decodedPath.data = decodedPath;
+parseResult = decodeUrl(&httpInfo.path, &httpInfo.decodedPath);
+
+// 2. Allocate and normalize path
+normalizedPath = malloc(httpInfo.decodedPath.len);
+httpInfo.normalizedPath.data = normalizedPath;
+parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
+
+// 3. Route using normalized path
+response_t response = requestHandler(&httpInfo, docroot_fd);
+
+// 4. Free path buffers before next iteration
+free(decodedPath);
+free(normalizedPath);
+```
+
+**Memory Management:**
+- `decodedPath` and `normalizedPath` allocated/freed per request
+- Prevents memory leaks in keep-alive connections with multiple requests
+- Cleanup section frees buffers even on error (goto cleanup pattern)
+
+### `main()` (v0.4 Updated)
+The main server initialization and connection acceptance loop.
+
+**New in v0.4:**
+```c
+// 1. Open document root directory (before fork loop)
+docroot_fd = open("public", O_RDONLY | O_DIRECTORY);
+
+// 2. Set socket read timeout structure
+struct timeval timeout;
+timeout.tv_sec = 10;
+timeout.tv_usec = 0;
+
+// 3. Apply timeout in handleClient (per connection)
+setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+```
+
+**Initialization Sequence:**
+1. Open `public/` directory → `docroot_fd`
+2. Create TCP socket
+3. Set socket options (`SO_REUSEADDR`, `SO_REUSEPORT`)
+4. Bind to port 8080
+5. Listen for connections (backlog=10)
+6. Setup `SIGCHLD` handler for zombie reaping
+
+**Connection Loop:**
+```
+while (1) {
+    new_socket = accept(server_fd, ...);  // Block until connection
+    
+    pid_t pid = fork();
+    if (pid == 0) {  // Child process
+        close(server_fd);              // Close server socket in child
+        handleClient(new_socket, docroot_fd);  // Pass docroot_fd
+        // handleClient never returns (exits or error)
+    }
+    else {  // Parent process
+        close(new_socket);             // Close client socket in parent
+        // Loop back to accept next connection
+    }
+}
+```
+
+**File Descriptor Inheritance:**
+- `docroot_fd` opened once by parent
+- Inherited by all child processes via `fork()` (copy-on-write)
+- Each child can use it independently (read-only, thread-safe)
+- Never closed (lives for server lifetime)
 
 ## Buffer Management Model
 
@@ -67,16 +173,53 @@ If `unparsedBytes > 0` (pipelined requests present):
 - Reset `parseOffset = 0`
 - Continue to parse next request
 
-## Keep-Alive Connection Logic (v0.2 Feature)
+## Keep-Alive Connection Logic (v0.2 Feature, URL Processing Added v0.4)
 
-### Connection Lifecycle
-1. Accept connection
-2. Allocate buffer and header array
-3. **Inner Loop**: Read → Parse → Handle → Respond
-4. After each response, check `response.shouldClose`:
-   - If `shouldClose == 1`: Break to cleanup (close connection)
-   - If `shouldClose == 0`: Continue loop (keep-alive)
-5. Cleanup and close connection
+### Connection Lifecycle (Updated v0.4)
+1. Accept connection (parent process)
+2. Fork child process
+3. **Child Process Lifecycle:**
+   - Configure socket timeout (10 seconds)
+   - Allocate buffer and header array
+   - **Inner Loop**: Read → Parse → Decode URL → Normalize → Handle → Respond
+   - After each response, check `response.shouldClose`:
+     - If `shouldClose == 1`: Break to cleanup (close connection)
+     - If `shouldClose == 0`: Free path buffers, continue loop (keep-alive)
+   - Cleanup and close connection, exit process
+
+### Request Timeout Protection (New in v0.4)
+
+**Timeout Configuration:**
+```c
+struct timeval timeout;
+timeout.tv_sec = 10;    // 10 seconds
+timeout.tv_usec = 0;
+
+setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+```
+
+**Behavior:**
+- Applied to `read()` calls on client socket
+- If client doesn't send data within 10 seconds, `read()` returns -1 with `errno = EAGAIN` or `EWOULDBLOCK`
+- Server sends 408 Request Timeout error response
+- Connection closed (no keep-alive for timed-out requests)
+
+**Benefits:**
+- Prevents slow client attacks (slowloris)
+- Releases resources from stalled connections
+- Each connection has independent timeout (per child process)
+
+**Limitations:**
+- Timeout applies per `read()` call, not request total time
+- Long requests with continuous data flow won't timeout
+- Send operations have no application-level timeout (rely on TCP)
+
+### Request Pipelining Support (Unchanged from v0.2)
+The server can process multiple pipelined requests from a single connection:
+- Client may send multiple requests without waiting for responses
+- Buffer preserves unparsed bytes after each request
+- Inner parse loop processes all complete requests in buffer
+- Continues reading only after processing buffered requests
 
 ### Keep-Alive Flow
 ```

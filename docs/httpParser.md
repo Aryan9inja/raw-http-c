@@ -2,14 +2,17 @@
 
 ## Overview
 
-`httpParser.c` implements HTTP/1.1 request parsing with a zero-copy design. It extracts request lines, headers, and body boundaries from raw TCP buffers without allocating memory, returning non-owning views (`bufferView_t`) into the caller's buffer.
+`httpParser.c` implements HTTP/1.1 and HTTP/1.0 request parsing with a zero-copy design. It extracts request lines, headers, and body boundaries from raw TCP buffers without allocating memory (except for path processing), returning non-owning views (`bufferView_t`) into the caller's buffer.
 
-### v0.3 Status
-The HTTP parser is **unchanged from v0.2**. The zero-copy design works identically in the multi-process model:
-- Each child process runs the parser independently on its client connection
-- Parser state is process-local (no shared state issues)
-- Buffer views remain valid within each child's buffer (no inter-process concerns)
-- No synchronization needed (process isolation provides it automatically)
+### v0.4 Status
+Major enhancements for **URL security** and **routing**:
+- **URL Decoding**: Percent-encoding decoding (`%20` → space, `%2F` → `/`)
+- **Path Normalization**: Resolves `.` and `..` segments, prevents directory traversal
+- **API Detection**: Identifies `/api/` prefix and strips it for routing
+- **HTTP/1.0 Support**: Accepts both HTTP/1.1 and HTTP/1.0 (disables keep-alive for 1.0)
+- **Enhanced httpInfo_t**: New fields for `decodedPath`, `normalizedPath`, `isApi`
+- Zero-copy design maintained: Parser still doesn't allocate for headers/body views
+- Process model unchanged: Each child process runs parser independently
 
 ## Design Philosophy
 
@@ -57,47 +60,285 @@ typedef struct {
 - Key is case-sensitive in storage (case-insensitive for special headers)
 
 ### `httpInfo_t`
-Complete parsed HTTP request:
+Complete parsed HTTP request with URL security processing (v0.4 enhanced):
 ```c
 typedef struct {
     bufferView_t method;
-    bufferView_t path;
+    bufferView_t path;              // Raw path from request line
     bufferView_t version;
-    header_t* headers;           // Array of headers
-    int headerCount;
-    unsigned long contentLength; // 0 if no Content-Length header
-    bufferView_t contentType;    // Empty if no Content-Type header
-    bufferView_t body;           // Empty if no body
-    int isKeepAlive;             // 1 = keep-alive, 0 = close
-    int isContentLengthSeen;     // Internal flag for duplicate detection
+    header_t* headers;               // Array of headers
+    int headerCnt;                   // Number of parsed headers
+    unsigned long contentLength;     // 0 if no Content-Length header
+    bufferView_t contentType;        // Empty if no Content-Type header
+    bufferView_t body;               // Empty if no body
+    int isKeepAlive;                 // 1 = keep-alive, 0 = close
+    int isContentLengthSeen;         // Internal flag for duplicate detection
+    bufferView_t decodedPath;        // URL-decoded path (v0.4, heap-allocated)
+    bufferView_t normalizedPath;     // Normalized safe path (v0.4, heap-allocated)
+    int isApi;                       // 1 if /api/ prefix, 0 otherwise (v0.4)
 } httpInfo_t;
 ```
 
+**New Fields (v0.4):**
+- `decodedPath`: Percent-decoded path (e.g., `/hello%20world` → `/hello world`)
+  - Memory: malloc'd buffer, freed by caller
+  - Length: Same or shorter than original path
+- `normalizedPath`: Safe path after resolving `.` and `..` segments
+  - Memory: malloc'd buffer, freed by caller
+  - Always starts with `/`, never escapes document root
+- `isApi`: Flag indicating `/api/` prefix was found and stripped
+  - 1: API route (path rewritten: `/api/foo` → `/foo`)
+  - 0: Static file route
+
+**Memory Ownership (v0.4 Changes):**
+- **Parser allocates**: `decodedPath.data` and `normalizedPath.data` (heap)
+- **Caller must free**: Both buffers after request processing
+- **All other views**: Still zero-copy (point into caller's buffer)
+
 ## Key Functions
 
-### `initializeHttpInfo(httpInfo_t* httpInfo, header_t* headerArray)`
+### `initializeHttpInfo()`
 Initializes `httpInfo_t` with default values before parsing.
 
+**Signature:**
+```c
+httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo);
+```
+
 **Defaults:**
-- All buffer views set to `{NULL, 0}`
-- `isKeepAlive = 1` (HTTP/1.1 default)
 - `contentLength = 0`
 - `isContentLengthSeen = 0`
-- `headers` points to caller-provided array
+- `isKeepAlive = 1` (HTTP/1.1 default)
+- `headerCnt = 0`
+- `isApi = 0` (v0.4)
+- `decodedPath.len = 0` (v0.4)
+- Other views: Not initialized (set during parsing)
+
+**Returns:** Pointer to initialized `httpInfo` (for chaining)
 
 **Invariant**: Must be called before every `requestAndHeaderParser()` call to ensure clean state.
 
 ### `requestAndHeaderParser()`
 Parses HTTP request line and all headers from buffer.
 
+**Signature:**
+```c
+parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo);
+```
+
 **Parsing Steps:**
 1. **Request Line**: Extract method, path, version (space-delimited)
-2. **Version Validation**: Ensure exactly "HTTP/1.1"
-3. **Header Loop**: Parse headers until `\r\n\r\n` (empty line)
-4. **Special Headers**: Extract Content-Length, Content-Type, Connection
-5. **Body Validation**: Verify GET requests have no body
+2. **Version Validation**: Ensure "HTTP/1.1" or "HTTP/1.0" (v0.4 updated)
+3. **HTTP/1.0 Handling**: Set `isKeepAlive = 0` for HTTP/1.0 requests
+4. **Header Loop**: Parse headers until `\r\n\r\n` (empty line)
+5. **Special Headers**: Extract Content-Length, Content-Type, Connection
+6. **Body Validation**: Verify GET requests have no body
+7. **API Detection**: Call `checkIfApi()` to identify `/api/` routes (v0.4)
 
 **Returns**: `parserResult_t` (OK on success, error code on failure)
+
+**Key Changes in v0.4:**
+- Accepts HTTP/1.0 (previously only HTTP/1.1)
+- Calls `checkIfApi()` to set `isApi` flag and rewrite path
+
+### `checkIfApi()`
+Detects `/api/` prefix and rewrites path for API routing (new in v0.4).
+
+**Signature:**
+```c
+void checkIfApi(httpInfo_t* httpInfo);
+```
+
+**Logic:**
+```
+┌─────────────────────────────┐
+│ Check path prefix           │
+└──────────┬──────────────────┘
+           │
+    ┌──────┴──────┐
+    │ Starts with │
+    │ "/api/"?    │
+    └──┬──────┬───┘
+  YES  │      │ NO
+       ▼      ▼
+    ┌────┐  ┌──────┐
+    │Set │  │isApi │
+    │isApi│  │= 0   │
+    │= 1 │  └──────┘
+    │    │
+    │Rewrite:│
+    │/api/foo│
+    │→ /foo  │
+    └────────┘
+```
+
+**Path Rewriting Examples:**
+- `/api/users` → `/users` (isApi=1, path adjusted)
+- `/api/` → `/` (isApi=1, edge case: exactly "/api/" becomes "/")
+- `/api` → (isApi=1, exactly "/api" with no trailing slash, path becomes "/" with len=1)
+- `/notapi` → `/notapi` (isApi=0, no change)
+- `/` → `/` (isApi=0, no change)
+
+**Implementation:**
+```c
+if (pathLength >= 5 && strncmp(pathStart, "/api/", 5) == 0) {
+    httpInfo->isApi = 1;
+    httpInfo->path.data = pathStart + 4;  // Skip "/api"
+    httpInfo->path.len = pathLength - 4;
+}
+else if (pathLength == 4 && strncmp(pathStart, "/api", 4) == 0) {
+    httpInfo->isApi = 1;
+    httpInfo->path.len = 1;  // Becomes "/"
+}
+```
+
+**Side Effects:**
+- Modifies `httpInfo->path` (pointer and length)
+- Sets `httpInfo->isApi` flag
+- Path rewrite is in-place (no allocation)
+
+### `decodeUrl()`
+Decodes percent-encoded URL characters (new in v0.4).
+
+**Signature:**
+```c
+parserResult_t decodeUrl(bufferView_t* requestPath, bufferView_t* decodedPath);
+```
+
+**Parameters:**
+- `requestPath`: Raw path from request line
+- `decodedPath`: Output buffer (caller must pre-allocate `decodedPath->data` with size >= `requestPath->len`)
+
+**Percent-Encoding Rules:**
+- `%XX` where XX are hex digits → single byte with value 0xXX
+- Examples: `%20` → space, `%2F` → `/`, `%3A` → `:`
+- Case-insensitive hex: `%2f` and `%2F` both decode to `/`
+
+**Algorithm:**
+```
+For each character in requestPath:
+    If '%':
+        Validate: next 2 chars exist and are hex digits
+        Convert hex → byte: high*16 + low
+        Write byte to decodedPath
+        Skip next 2 chars
+    Else:
+        Copy character as-is
+```
+
+**Error Conditions:**
+- `%` at end of string or `%X` (incomplete sequence)
+- Invalid hex digits (e.g., `%ZZ`, `%2G`)
+- Returns `BAD_REQUEST_PATH` on any validation failure
+
+**Example Inputs/Outputs:**
+```
+/hello%20world        → /hello world
+/path%2Fto%2Ffile     → /path/to/file
+/%2e%2e%2fetc%2fpasswd → /../etc/passwd  (normalized later)
+/hello%2               → BAD_REQUEST_PATH (incomplete)
+/hello%ZZ              → BAD_REQUEST_PATH (invalid hex)
+```
+
+**Security Note:**
+Decoding happens *before* normalization. Malicious paths like `/%2e%2e/etc/passwd` are decoded to `/../etc/passwd` then rejected by `normalizePath()`.
+
+### `normalizePath()`
+Resolves `.` and `..` segments to prevent directory traversal (new in v0.4).
+
+**Signature:**
+```c
+parserResult_t normalizePath(bufferView_t* decodedPath, bufferView_t* normalizedPath);
+```
+
+**Parameters:**
+- `decodedPath`: URL-decoded path (may contain `.` and `..`)
+- `normalizedPath`: Output buffer (caller must pre-allocate `normalizedPath->data` with size >= `decodedPath->len`)
+
+**Algorithm (Stack-based path resolution):**
+```
+Initialize: stack = ['/']
+
+For each path segment (separated by '/'):
+    If segment is '.':
+        Ignore (current directory, no-op)
+    Else if segment is '..':
+        If stack is empty (would escape root):
+            Return BAD_REQUEST_PATH
+        Else:
+            Pop previous segment from stack
+    Else (normal segment):
+        Push '/' and segment onto stack
+
+Result: Stack contents = normalized path
+```
+
+**Flow Diagram:**
+```
+┌──────────────────┐
+│ Start: stack=[/] │
+└────────┬─────────┘
+         │
+    ┌────▼─────┐
+    │For each  │
+    │segment   │
+    └────┬─────┘
+         │
+    ┌────┴────┐
+    │ Type?   │
+    └┬──┬──┬──┘
+     │  │  │
+   . │  ││ ││ .. │  │ normal
+     ▼  ▼  ▼
+   ┌──┐┌────┐┌──────┐
+   │Skip││Pop ││Push  │
+   └──┘│seg ││seg   │
+       └┬───┘└───┬──┘
+        │ (check │
+        │  root) │
+        ▼        ▼
+    ┌───────┐ ┌──────┐
+    │At root?│ │Add / │
+    │→ ERROR │ │+seg  │
+    └───────┘ └──────┘
+```
+
+**Example Transformations:**
+```
+Input                Output           Notes
+──────────────────   ─────────────    ────────────────────
+/a/b/c               /a/b/c           No change
+/a/./b               /a/b             . ignored
+/a/../b              /b               .. pops /a
+/a/b/../../c         /c               Two pops
+/../etc/passwd       BAD_REQUEST_PATH Escape attempt
+/./a/./../b/./c      /b/c             Multiple . and ..
+/                    /                Root unchanged
+//a///b//            /a/b             Redundant / skipped
+```
+
+**Security Guarantees:**
+1. **No Root Escape**: Attempting `..` when at `/` returns error
+2. **Always Absolute**: Result always starts with `/`
+3. **No Redundant Separators**: Multiple `/` collapsed to single
+4. **Deterministic**: Same input always produces same output
+
+**Edge Cases:**
+- Empty path → malformed (not passed to this function)
+- `/..` → `BAD_REQUEST_PATH`
+- `/.` → `/`
+- `/a/b/c/../../..` → `/` (valid, resolves to root)
+- `/a/b/c/../../../..` → `BAD_REQUEST_PATH` (escapes root)
+
+**Attack Prevention:**
+```
+Attack Path                    Decoded           Normalized        Result
+────────────────────────────   ───────────────   ───────────────   ──────
+/../../etc/passwd              /../../etc/passwd BAD_REQUEST_PATH  Blocked
+/%2e%2e/%2e%2e/etc/passwd      /../etc/passwd    BAD_REQUEST_PATH  Blocked
+/static/../../../etc/passwd    /static/../etc/.. BAD_REQUEST_PATH  Blocked
+/./././../../../etc/passwd     /../../../etc/.   BAD_REQUEST_PATH  Blocked
+```
 
 ### `bodyParser()`
 Creates a buffer view for the request body based on `Content-Length`.
@@ -120,17 +361,168 @@ Case-insensitive length-bounded substring search.
 
 **Use Case**: Search for "close" in Connection header value without null-terminated strings.
 
-## HTTP/1.1 Protocol Requirements
+## HTTP Protocol Support
 
-### Version Enforcement
-- **Only HTTP/1.1 Accepted**: Returns `INVALID_VERSION` for other versions
-- **Exact Match Required**: "HTTP/1.1" (case-sensitive)
-- **No HTTP/1.0**: Not supported (different keep-alive semantics)
-- **No HTTP/2**: Not supported
+### Version Enforcement (Updated v0.4)
+- **HTTP/1.1 Accepted**: Primary version, default keep-alive behavior
+- **HTTP/1.0 Accepted** (new in v0.4): For Apache Bench compatibility
+  - Automatically sets `isKeepAlive = 0` (no persistent connections)
+  - Otherwise parsed identically to HTTP/1.1
+- **Exact Match Required**: "HTTP/1.1" or "HTTP/1.0" (case-sensitive)
+- **No HTTP/2**: Not supported (different framing, binary protocol)
+- **INVALID_VERSION**: Returned for any other version string
 
-**Rationale**: Simplifies keep-alive logic - HTTP/1.1 defaults to persistent connections.
+**Version Detection Code:**
+```c
+if (strncmp(versionStart, "HTTP/1.1", 8) != 0 &&
+    strncmp(versionStart, "HTTP/1.0", 8) != 0) {
+    return INVALID_VERSION;
+}
 
-### Keep-Alive Semantics (v0.2 Feature)
+if (strncmp(versionStart, "HTTP/1.0", 8) == 0) {
+    httpInfo->isKeepAlive = 0;  // HTTP/1.0 closes after response
+}
+```
+
+**Rationale for HTTP/1.0 Support:**
+- Apache Bench (`ab`) tool uses HTTP/1.0 by default
+- Enables benchmarking without custom configuration
+- Minimal implementation cost (single flag change)
+
+## URL Processing Pipeline (New in v0.4)
+
+Complete request path processing from raw URL to safe file path:
+
+```
+┌─────────────────────────────────┐
+│ Raw Request: GET /api%2Fhello   │
+│              HTTP/1.1            │
+└──────────────┬──────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 1. parseRequest() extracts path  │
+│    httpInfo->path = "/api%2Fhello"│
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 2. decodeUrl() percent-decodes   │
+│    decodedPath = "/api/hello"    │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 3. checkIfApi() detects /api/    │
+│    isApi = 1                      │
+│    path rewritten = "/hello"      │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 4. normalizePath() resolves . ..  │
+│    normalizedPath = "/hello"      │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 5. Handler routes based on:       │
+│    - isApi flag                   │
+│    - normalizedPath               │
+└───────────────────────────────────┘
+```
+
+### Processing Order Importance
+
+**Correct Order** (implemented):
+```
+Raw → Decode → Normalize → Route
+```
+
+**Why This Order:**
+1. **Decode First**: Attackers can encode `.` and `/` to bypass checks
+   - `%2e%2e` → `..` must be decoded before normalization
+2. **Normalize Second**: Clean path for consistent routing
+3. **Route Last**: Operate on safe, canonical paths
+
+**Anti-Pattern** (insecure):
+```
+Raw → Normalize → Decode  ❌ WRONG
+```
+Problem: `/%2e%2e/etc` would pass normalization, decode to `/../etc`
+
+### Security Layering
+
+**Defense in Depth (Multiple Barriers):**
+1. **URL Decoding Validation**: Rejects malformed percent-encoding
+2. **Path Normalization**: Rejects `..` escape attempts
+3. **openat() with Base FD**: Kernel-level path containment
+4. **Regular File Check**: Blocks directory access
+
+**Any single layer can prevent attacks, but all layers present:**
+
+```
+Attack: /%2e%2e/etc/passwd
+
+Layer 1: decodeUrl() → /../etc/passwd (passes, valid encoding)
+Layer 2: normalizePath() → BAD_REQUEST_PATH (blocks, .. at root)
+         ✅ BLOCKED HERE
+
+Even if Layer 2 failed:
+Layer 3: openat(docroot_fd, "../etc/passwd") → ENOENT (stays in docroot)
+         ✅ BLOCKED HERE TOO
+```
+
+## Security Invariants (New in v0.4)
+
+### Path Safety Guarantees
+1. **No Directory Traversal**: `normalizePath()` prevents escaping document root
+2. **Canonical Form**: Same logical path always produces same normalized path
+3. **Validation Before Use**: Errors returned before path reaches filesystem
+4. **Attack Surface Reduced**: Rejects malformed input early in pipeline
+
+### URL Decoding Invariants
+1. **Strict Validation**: Invalid percent-encoding always rejected
+2. **No Partial Decoding**: All-or-nothing (error if any `%XX` is malformed)
+3. **Length Bound**: Decoded path ≤ original path length (never grows)
+4. **Deterministic**: Same input always produces same output
+
+### Path Normalization Invariants
+1. **Root Anchored**: Result always starts with `/`
+2. **No Escape**: Result path never leaves document root (no leading `..`)
+3. **Idempotent**: Normalizing an already-normalized path returns same result
+4. **No Redundancy**: No `.`, `..`, or redundant `/` in output
+
+### API Detection Invariants
+1. **Prefix Match Only**: Only `/api/` and `/api` trigger API routing
+2. **Path Rewrite Consistent**: Strip exactly 4 characters (`/api`)
+3. **Non-API Default**: Missing `/api/` prefix → static file serving
+
+### Memory Safety (v0.4 Changes)
+1. **Caller Frees Paths**: `decodedPath` and `normalizedPath` buffers must be freed
+2. **Allocation Failure**: Returns error if malloc fails (decodedPath/normalizedPath buffers)
+3. **No Buffer Overrun**: Length checks prevent writing past buffer end
+
+## Keep-Alive Semantics (v0.2 Feature, HTTP/1.0 Update in v0.4)
+
+#### Default Behavior
+- **HTTP/1.1**: `isKeepAlive` initialized to `1` (persistent connections)
+- **HTTP/1.0**: `isKeepAlive` set to `0` (close after response)
+
+#### Connection Header Processing
+- **Case-Insensitive Search**: Uses `strcasestr_len()` to find "close" substring
+- **Close Detection**: Any occurrence of "close" sets `isKeepAlive = 0`
+- **Keep-Alive Explicit**: "Connection: keep-alive" not required for HTTP/1.1 (default)
+
+**Examples:**
+```
+HTTP/1.1 + Connection: close           → isKeepAlive = 0
+HTTP/1.1 + Connection: Close           → isKeepAlive = 0
+HTTP/1.1 + Connection: keep-alive      → isKeepAlive = 1
+HTTP/1.1 + Connection: upgrade, close  → isKeepAlive = 0
+HTTP/1.1 + (no Connection header)      → isKeepAlive = 1
+HTTP/1.0 + (any Connection header)     → isKeepAlive = 0 (version override)
+```
 
 #### Default Behavior
 - `isKeepAlive` initialized to `1` (true)
