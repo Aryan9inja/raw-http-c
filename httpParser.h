@@ -9,7 +9,7 @@
  * len: Length of the buffer view
  */
 typedef struct {
-    const char* data;
+    char* data;
     size_t len;
 }bufferView_t;
 
@@ -33,6 +33,7 @@ typedef struct {
  * isContentLengthSeen: Flag indicating if Content-Length was present
  * body: Request body data
  * isKeepAlive: Flag for persistent connection (1=keep-alive, 0=close)
+ * isApi: To check if the request is api or file request
  */
 typedef struct {
     bufferView_t method;
@@ -45,6 +46,9 @@ typedef struct {
     int isContentLengthSeen;
     bufferView_t body;
     int isKeepAlive;
+    int isApi;
+    bufferView_t decodedPath;
+    bufferView_t normalizedPath;
 }httpInfo_t;
 
 /**
@@ -63,7 +67,8 @@ typedef enum {
     HEADER_TOO_LARGE,
     TOO_MANY_HEADERS,
     PAYLOAD_TOO_LARGE,
-    REQUEST_TIMEOUT
+    REQUEST_TIMEOUT,
+    BAD_REQUEST_PATH
 }parserResult_t;
 
 /**
@@ -83,5 +88,9 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
  * @return parserResult_t indicating success (OK) or specific error
  */
 parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo);
+
+parserResult_t decodeUrl(bufferView_t* requestPath, bufferView_t* decodedPath);
+
+parserResult_t normalizePath(bufferView_t* decodedPath, bufferView_t* normalizedPath);
 
 #endif

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Raw HTTP Test</title>
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<header class="site-header">
+			<h1>Raw HTTP Server Test</h1>
+			<p class="tagline">Static assets and basic routes sanity check.</p>
+		</header>
+
+		<main class="content">
+			<section class="card">
+				<h2>Status</h2>
+				<p id="status-text">Loading...</p>
+				<button id="ping-btn" type="button">Ping</button>
+			</section>
+
+			<section class="card">
+				<h2>Request Log</h2>
+				<ul id="log-list"></ul>
+			</section>
+		</main>
+
+		<footer class="site-footer">
+			<small>Test page served by your C HTTP server.</small>
+		</footer>
+
+		<script src="script.js"></script>
+	</body>
+</html>

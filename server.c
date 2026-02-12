@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <fcntl.h>
 #include "httpParser.h"
 #include "handlers.h"
 
@@ -36,7 +37,8 @@ error_entry_t error_table[] = {
     {HEADER_TOO_LARGE,431,"Request Header Fields Too Large"},
     {TOO_MANY_HEADERS,400,"Too Many Headers"},
     {PAYLOAD_TOO_LARGE,413,"Payload Too Large"},
-    {REQUEST_TIMEOUT,408,"Request Timeout"}
+    {REQUEST_TIMEOUT,408,"Request Timeout"},
+    {BAD_REQUEST_PATH,400,"Bad Path For Request"}
 };
 
 // Handle parser errors by sending appropriate HTTP error response
@@ -71,7 +73,7 @@ void burnZombies(int s) {
     errno = saved_errno;
 }
 
-void handleClient(int new_socket) {
+void handleClient(int new_socket, int docroot_fd) {
     // Allocate buffer for reading HTTP requests
     size_t bufferSize = BUFFER_SIZE;
     char* buffer = malloc(bufferSize);
@@ -87,6 +89,8 @@ void handleClient(int new_socket) {
     size_t readOffset = 0;
     size_t parseOffset = 0;
     char* headerEnd = NULL;
+    char* decodedPath = NULL;
+    char* normalizedPath = NULL;
 
     // Main loop: read data from client
     while (1) {
@@ -159,14 +163,50 @@ void handleClient(int new_socket) {
                 handleParseError(parseResult, new_socket);
                 goto cleanup;
             }
+
+            // Decode and normalize Url before sending to response generation
+            decodedPath = malloc(httpInfo.path.len);
+            if (!decodedPath) {
+                perror("Malloc failed");
+                goto cleanup;
+            }
+            httpInfo.decodedPath.data = decodedPath;
+            httpInfo.decodedPath.len = 0;
+            parseResult = decodeUrl(&httpInfo.path, &httpInfo.decodedPath);
+            if (parseResult != OK) {
+                handleParseError(parseResult, new_socket);
+                goto cleanup;
+            }
+
+            normalizedPath = malloc(httpInfo.decodedPath.len);
+            if (!normalizedPath) {
+                perror("Malloc failed");
+                goto cleanup;
+            }
+            httpInfo.normalizedPath.data = normalizedPath;
+            httpInfo.normalizedPath.len = httpInfo.decodedPath.len;
+            parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
+
+            if (parseResult != OK) {
+                handleParseError(parseResult, new_socket);
+                goto cleanup;
+            }
+
             printf("Request Processed. Method: %.*s, Body Size: %zu\n", (int)httpInfo.method.len, httpInfo.method.data, httpInfo.contentLength);
 
             // Generate and send response
-            response_t response = requestHandler(&httpInfo);
+            // Will send decoded path after normalization is complete, first I will work on normalization
+            response_t response = requestHandler(&httpInfo, docroot_fd);
             sendResponse(new_socket, &response);
             if (response.shouldClose == 1) goto cleanup;
 
-            printf("Response sent");
+            printf("Response sent\n");
+
+            // Free decoded and normalized path before new request
+            free(decodedPath);
+            decodedPath = NULL;
+            free(normalizedPath);
+            normalizedPath = NULL;
 
             parseOffset += totalRequestSize;
         }
@@ -182,6 +222,8 @@ void handleClient(int new_socket) {
 
 cleanup:
     // Clean up and close connections
+    free(normalizedPath);
+    free(decodedPath);
     free(headerArray);
     free(buffer);
     close(new_socket);
@@ -189,7 +231,7 @@ cleanup:
 }
 
 int main() {
-    int server_fd, new_socket;
+    int server_fd, new_socket, docroot_fd;
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
     int opt = 1;
@@ -201,6 +243,12 @@ int main() {
     sa.sa_handler = burnZombies;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
+
+    // Open file descriptor to server_file_root folder
+    if ((docroot_fd = open("public", O_RDONLY | O_DIRECTORY)) == -1) {
+        perror("open failed");
+        exit(EXIT_FAILURE);
+    }
 
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
         perror("sigaction");
@@ -258,7 +306,7 @@ int main() {
             // Child process will handle the client
             // It does not care about server file descriptor
             close(server_fd);
-            handleClient(new_socket);
+            handleClient(new_socket, docroot_fd);
         }
         else {
             // Parent process will listen for new connections

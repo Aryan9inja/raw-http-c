@@ -1,24 +1,31 @@
-# HTTP/1.1 Server in C - v0.3
+# HTTP/1.1 Server in C - v0.4
 
-A lightweight HTTP/1.1 server implementation in C with process-based concurrency, persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
+A lightweight HTTP/1.1 server implementation in C with static file serving, process-based concurrency, persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
 
 ## Features
 
 ### Core Capabilities
+- **Static File Serving (v0.4)**: Serve files from `public/` directory with zero-copy `sendfile()`
+  - Automatic Content-Type detection based on file extensions
+  - Secure path resolution with `openat()` (prevents directory traversal)
+  - Default `index.html` serving for root path
 - **Process-Based Concurrency (v0.3)**: Handle multiple concurrent clients using `fork()` 
   - Parent process accepts connections; child processes handle individual clients
   - Clear process isolation and lifecycle management
   - Zero-copy architecture maintained across concurrent connections
-- **HTTP/1.1 Protocol**: Full HTTP/1.1 request parsing and response generation
+- **HTTP/1.1 & HTTP/1.0 Protocol**: Full request parsing and response generation
 - **Keep-Alive Connections**: Persistent connections with multiple requests per connection within each client process
 - **Request Pipelining**: Handle multiple pipelined requests efficiently
 - **Zero-Copy Parsing**: Memory-efficient parsing using buffer views without duplication
 - **Binary Safe**: Handles arbitrary byte sequences in request/response bodies
 - **Dynamic Buffers**: Automatic buffer growth up to configurable limits
+- **URL Security**: Percent-encoding decoding and path normalization (v0.4)
 
 ### Current Endpoints
-- `GET /` - Returns "Hello" message
-- `POST /echo` - Echoes the request body back to client
+- **Static Files**: Any file in `public/` directory (e.g., `GET /`, `GET /style.css`, `GET /script.js`)
+- **API Routes** (prefix with `/api/`):
+  - `GET /api/` - Returns "Hello" message
+  - `POST /api/echo` - Echoes the request body back to client
 
 ## Architecture
 
@@ -116,23 +123,26 @@ The server uses `fork()` to handle multiple concurrent clients without threading
 ## Protocol Support
 
 ### Supported
-- HTTP/1.1 request/response
+- HTTP/1.1 and HTTP/1.0 request/response
 - Persistent connections (keep-alive)
 - Request pipelining
 - Content-Length based body parsing
+- Content-Type header generation
 - Binary request/response bodies
 - GET and POST methods
 - Connection header handling
+- Static file serving from document root
+- URL percent-encoding decoding
 
 ### Not Yet Supported
-- HTTP/1.0 (different keep-alive semantics)
 - HTTP/2
 - Chunked transfer encoding
 - Multipart/form-data parsing
-- Static file serving (planned for future release)
 - HTTPS/TLS
 - Additional HTTP methods (HEAD, PUT, DELETE, OPTIONS, etc.)
 - Compression (gzip/deflate)
+- Range requests (partial content)
+- Caching headers (ETag, Last-Modified)
 
 ## Building and Running
 
@@ -152,22 +162,44 @@ make run      # Build and start server on port 8080
 make clean    # Remove build artifacts
 ```
 
+## Performance
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed Apache Bench results.
+
+**Key Metrics** (AMD Ryzen 5 5600H, 12 cores):
+- Static file serving: ~10,300 req/sec (HTML, c=100)
+- API endpoints: ~11,300 req/sec (c=50)
+- Latency: <1ms (p95) at medium concurrency
+- Zero-copy `sendfile()` efficiency: ~8-10% overhead vs in-memory responses
+
 ## Testing
 
 Example using `curl`:
 
 ```bash
-# GET request
-curl http://localhost:8080/
+# Static file requests
+curl http://localhost:8080/              # Serves public/index.html
+curl http://localhost:8080/style.css     # Serves public/style.css
+curl http://localhost:8080/script.js     # Serves public/script.js
 
-# POST echo
-curl -X POST http://localhost:8080/echo -d "Hello, Server!"
+# API requests
+curl http://localhost:8080/api/          # Returns "Hello"
+curl -X POST http://localhost:8080/api/echo -d "Hello, Server!"
 
 # Keep-alive (multiple requests, single connection)
-curl -v http://localhost:8080/ http://localhost:8080/echo
+curl -v http://localhost:8080/ http://localhost:8080/style.css
 
 # Request with explicit Connection: close
 curl -H "Connection: close" http://localhost:8080/
+```
+
+**Apache Bench:**
+```bash
+# Benchmark static file serving
+ab -n 10000 -c 100 http://localhost:8080/
+
+# Benchmark API endpoint
+ab -n 10000 -c 50 -p /dev/null http://localhost:8080/api/echo
 ```
 
 ## Limitations & Known Issues
@@ -175,12 +207,20 @@ curl -H "Connection: close" http://localhost:8080/
 ### Current Limitations
 - **Process Overhead**: Each connection spawns a new process (more memory per client than threads)
 - **No Async I/O**: Process blocks on socket reads (not a concern with separate processes)
-- **Limited Routes**: Only 2 endpoints (/ and /echo)
-- **No Static Files**: Cannot serve HTML, CSS, JS, or other files
-- **No Timeouts**: Connections can hang indefinitely (10-second socket read timeout exists)
+- **Limited API Routes**: Only 2 API endpoints (/api/ and /api/echo)
+- **No HEAD Method**: HEAD requests return 405 Method Not Allowed
+- **No Range Requests**: Cannot serve partial file content (no byte-range support)
+- **No Caching**: No ETag or Last-Modified headers for browser caching
 - **Hardcoded Port**: Always uses port 8080
 - **No Logging**: Minimal debug output only
 - **No Thread Pool**: Creates new process per connection (suitable for moderate concurrency, not high C10K workloads)
+
+### Fixed in v0.4
+- ✅ **Static File Serving**: Server now serves files from `public/` directory with `sendfile()`
+- ✅ **Content-Type Detection**: Automatic MIME type headers based on file extensions
+- ✅ **Path Traversal Protection**: URL decoding and normalization prevent directory escape
+- ✅ **HTTP/1.0 Support**: Compatible with older HTTP clients and Apache Bench
+- ✅ **Request Timeout**: 10-second socket timeout prevents slow client attacks
 
 ### Fixed in v0.3
 - ✅ **Concurrent Connections**: Server now handles multiple clients simultaneously via `fork()`
@@ -189,12 +229,16 @@ curl -H "Connection: close" http://localhost:8080/
 See individual component documentation for detailed limitations and assumptions.
 
 ## Future Goals
-### v0.4 — Static File Serving
-- Primary concept: filesystem + HTTP interaction
-- Serve files from a document root
-- Content-Type detection
-- Safe path resolution
-- Efficient file streaming
+
+### v0.5 — Event-Driven Architecture
+**Goal**: Rewrite architecture to event-driven using epoll. Non-blocking sockets. Per-connection state machine. Scalable design.
+- Replace process-per-connection with single-process event loop
+- Use `epoll()` for efficient I/O multiplexing (Linux)
+- Non-blocking socket I/O with edge-triggered notifications
+- State machine for connection lifecycle management
+- Target: 10,000+ concurrent connections (C10K scalability)
+- Eliminate process creation overhead
+- Memory-efficient connection handling
 
 ### Long-term Goals
 - Configurable ports and settings

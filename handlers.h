@@ -30,21 +30,39 @@ typedef struct{
     char* body;
     size_t bodyLen;
     int shouldClose;
+    int fileDescriptor;
+    size_t fileSize;
+    char* contentType;
 }response_t;
 
 /**
  * Enum for request response status
  */
 typedef enum {
-    Ok
+    Ok,
+    FILE_SEND_ERROR,
+    INTERNAL_SERVER_ERROR,
+    HEADER_SEND_ERROR,
+    BODY_SEND_ERROR
 }requestResponse_t;
+
+/**
+ * Enum for api routes
+ */
+typedef enum{
+    ROUTE_ROOT,
+    ROUTE_ECHO,
+    ROUTE_NOT_FOUND,
+    ROUTE_UNKNOWN_METHOD,
+}apiRoutes_t;
 
 /**
  * Handles incoming HTTP requests and generates appropriate responses
  * @param httpInfo Pointer to parsed HTTP request information
+ * @param root_fd File descriptor for static file root folder
  * @return response_t structure containing the HTTP response
  */
-response_t requestHandler(httpInfo_t* httpInfo);
+response_t requestHandler(httpInfo_t* httpInfo, int root_fd);
 
 /**
  * Sends an HTTP response through a socket
