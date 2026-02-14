@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
-#include <sys/wait.h>
+#include <sys/epoll.h>
 #include <errno.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -64,13 +64,6 @@ void handleParseError(parserResult_t res, int socket) {
         status, msg);
 
     send(socket, response, len, 0);
-}
-
-void burnZombies(int s) {
-    (void)s; // Tell the compiler to shut up
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-    errno = saved_errno;
 }
 
 void handleClient(int new_socket, int docroot_fd) {
@@ -239,19 +232,9 @@ int main() {
     timeout.tv_sec = 10;
     timeout.tv_usec = 0;
 
-    struct sigaction sa;
-    sa.sa_handler = burnZombies;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-
     // Open file descriptor to server_file_root folder
     if ((docroot_fd = open("public", O_RDONLY | O_DIRECTORY)) == -1) {
         perror("open failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        perror("sigaction");
         exit(EXIT_FAILURE);
     }
 
@@ -260,6 +243,9 @@ int main() {
         fprintf(stderr, "Socket creation failed\n");
         exit(EXIT_FAILURE);
     }
+    // Set server_fd to be non-blocking
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
     // Configure socket to allow port reuse
     if ((setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) < 0) {
@@ -278,40 +264,54 @@ int main() {
     }
 
     // Listen to the socket
-    if ((listen(server_fd, 3)) < 0) {
+    if ((listen(server_fd, 50)) < 0) {
         fprintf(stderr, "Error while listening\n");
         exit(EXIT_FAILURE);
     }
 
+    int epoll_fd = epoll_create(1);
+
+    struct epoll_event ev, events[100];
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+        perror("epoll_ctl: server_fd");
+        exit(EXIT_FAILURE);
+    }
+
     while (1) {
-        // Accept new connection
-        if ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) < 0) {
-            fprintf(stderr, "Error while accepting\n");
-            exit(EXIT_FAILURE);
+        int socketEvents = epoll_wait(epoll_fd, events, 64, -1);
+        if (socketEvents == -1) {
+            perror("epoll_wait");
+            break;
         }
 
-        // Configure socket to timeout after sometime
-        if ((setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) < 0) {
-            fprintf(stderr, "Socket timeout setup failed\n");
-            exit(EXIT_FAILURE);
-        }
+        for (int i = 0;i < socketEvents;i++) {
+            if (events[i].data.fd == server_fd) {
+                // Accept new connection
+                while ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) != -1) {
+                    // Configure socket to timeout after sometime
+                    // if ((setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) < 0) {
+                    //     fprintf(stderr, "Socket timeout setup failed\n");
+                    //     exit(EXIT_FAILURE);
+                    // }
 
-        pid_t pid = fork();
+                    char dummy[1024];
+                    recv(new_socket, dummy, sizeof(dummy), 0);
 
-        if (pid < 0) {
-            perror("Fork failed");
-            exit(EXIT_FAILURE);
-        }
-        else if (pid == 0) {
-            // Child process will handle the client
-            // It does not care about server file descriptor
-            close(server_fd);
-            handleClient(new_socket, docroot_fd);
-        }
-        else {
-            // Parent process will listen for new connections
-            // It does not handle client
-            close(new_socket);
+                    // 2. The "I'm alive" response
+                    // ab needs to see a valid HTTP status line to count a 'success'
+                    const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(new_socket, response, strlen(response), 0);
+                    close(new_socket);
+                    printf("Accepted and closed connection\n");
+                }
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    perror("accept");
+                }
+            }else{
+                
+            }
         }
     }
 
