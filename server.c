@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include "httpParser.h"
 #include "handlers.h"
+#include "connection.h"
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
@@ -119,7 +120,7 @@ void handleClient(int new_socket, int docroot_fd) {
             char* headerBlockEnd = headerEnd + 2;
             // Passing start of current request, not the buffer start
             httpInfo_t httpInfo;
-            parserResult_t parseResult = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, headerArray, &httpInfo);
+            parserResult_t parseResult = requestAndHeaderParser(buffer + parseOffset, headerBlockEnd, &httpInfo);
             if (parseResult != OK) {
                 handleParseError(parseResult, new_socket);
                 goto cleanup;
@@ -280,7 +281,7 @@ int main() {
     }
 
     while (1) {
-        int socketEvents = epoll_wait(epoll_fd, events, 64, -1);
+        int socketEvents = epoll_wait(epoll_fd, events, 100, -1);
         if (socketEvents == -1) {
             perror("epoll_wait");
             break;
@@ -296,21 +297,53 @@ int main() {
                     //     exit(EXIT_FAILURE);
                     // }
 
-                    char dummy[1024];
-                    recv(new_socket, dummy, sizeof(dummy), 0);
+                    // Set the client socket as non-blocking
+                    int flags = fcntl(new_socket, F_GETFL, 0);
+                    fcntl(new_socket, F_SETFL, flags | O_NONBLOCK);
 
-                    // 2. The "I'm alive" response
-                    // ab needs to see a valid HTTP status line to count a 'success'
-                    const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    send(new_socket, response, strlen(response), 0);
-                    close(new_socket);
-                    printf("Accepted and closed connection\n");
+                    // Add the new socket to epoll
+                    connection_t* conn = malloc(sizeof(connection_t));
+                    initializeConnection(conn, new_socket);
+
+                    if (conn->state != READING_HEADERS) {
+                        exit(EXIT_FAILURE);
+                    }
+
+                    struct epoll_event conn_ev;
+                    conn_ev.events = EPOLLIN;
+                    conn_ev.data.ptr = conn;
+
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &conn_ev) == -1) {
+                        perror("epoll_ctl: server_fd");
+                        close(new_socket);
+                        free(conn);
+                    }
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("accept");
                 }
-            }else{
-                
+            }
+            else {
+                connection_t* conn = events[i].data.ptr;
+                u_int32_t epoll_events = events[i].events;
+                uint32_t mask = connectionHandler(conn, epoll_events);
+                int event_fd = events[i].data.fd;
+
+                if (mask == -1) {
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_fd, &events[i]) == -1) {
+                        perror("epoll_ctl: del epollin");
+                        return EXIT_FAILURE;
+                    }
+                }
+                else {
+                    struct epoll_event temp_ev;
+                    ev.data.ptr = conn;
+                    ev.events = mask;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_fd, &temp_ev) == -1) {
+                        perror("epoll_ctl: mod epollin");
+                        connectionHandler(conn, EPOLLERR);
+                    }
+                }
             }
         }
     }
