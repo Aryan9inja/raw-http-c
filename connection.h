@@ -2,8 +2,8 @@
 #define CONNECTION_H
 
 #include <sys/types.h>
-#include "httpParser.h"
-
+#include <stdint.h>
+#include"httpParser.h"
 typedef enum {
     READING_HEADERS,
     READING_BODY,

@@ -5,6 +5,8 @@
 #include <sys/epoll.h>
 #include <sys/errno.h>
 #include <string.h>
+#include <sys/socket.h>
+#include "httpParser.h"
 
 #define READ_BUFFER_SIZE 4096 // 4kb
 #define MAX_HEADER_SIZE 8192 // 8kb
@@ -12,7 +14,7 @@
 void initializeConnection(connection_t* conn, int fd) {
     conn->fd = fd;
     conn->state = READING_HEADERS;
-    conn->header_end = NULL;
+    conn->header_end = 0;
     conn->parse_offset = 0;
     conn->read_len = 0;
     conn->read_cap = READ_BUFFER_SIZE;
@@ -23,6 +25,14 @@ void initializeConnection(connection_t* conn, int fd) {
         return;
     }
     conn->write_buf = NULL; // so that freeing will not stop the program
+    fprintf(stdout, "Connection Initialized\n");
+}
+
+void closeConnection(connection_t* conn) {
+    close(conn->fd);
+    free(conn->read_buf);
+    free(conn->write_buf);
+    free(conn);
 }
 
 void handleHeaders(connection_t* conn) {
@@ -30,6 +40,7 @@ void handleHeaders(connection_t* conn) {
     char* header_end = strstr(conn->read_buf + conn->parse_offset, "\r\n\r\n");
     if (!header_end) {
         // Wait for next EPOLLIN
+        fprintf(stdout, "No header end, returning\n");
         return;
     }
     // Calculate offset so that if later we realloc nothing changes
@@ -46,6 +57,7 @@ void handleHeaders(connection_t* conn) {
     }
 
     // parserResult_t requestAndHeaderParser()
+    fprintf(stdout, "Calling parser\n");
     parserResult_t headerParsingRes = requestAndHeaderParser(
         conn->read_buf + conn->parse_offset,
         conn->read_buf + conn->header_end + 2, // Because of my invarient in parser
@@ -53,11 +65,13 @@ void handleHeaders(connection_t* conn) {
     );
 
     if (headerParsingRes != OK) {
+        fprintf(stdout, "Parsing Error Encountered\n");
         handleParseError(headerParsingRes, conn);
         return;
     }
 
     // Since everyting is fine we can say header parsing completed
+    fprintf(stdout, "Header parsing successfull\n");
     conn->state = READING_BODY;
     // Update parse offset
     conn->parse_offset += header_size;
@@ -66,6 +80,7 @@ void handleHeaders(connection_t* conn) {
 void handleRead(connection_t* conn) {
     while (1) {
         // Read into remaining buffer
+        fprintf(stdout, "Reading the request buffer\n");
         ssize_t valread = read(conn->fd, conn->read_buf + conn->read_len, conn->read_cap - conn->read_len);
         if (valread > 0) {
             conn->read_len += valread;
@@ -106,46 +121,46 @@ void handleRead(connection_t* conn) {
         return;
     }
     else if (conn->state == READING_HEADERS) {
+        fprintf(stdout, "Starting header parsing\n");
         handleHeaders(conn);
     }
 }
 
 // I will first write about when there is parse error state
 void handleWrite(connection_t* conn) {
-
-}
-
-void closeConnection(connection_t* conn) {
-    close(conn->fd);
-    free(conn->read_buf);
-    free(conn->write_buf);
-    free(conn);
+    conn->write_sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
+    fprintf(stdout,"Sent %zu bytes of data", conn->write_sent);
+    conn->state=CLOSING;
 }
 
 uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
+    uint32_t closingSignal=-1;
     if (events & (EPOLLERR | EPOLLHUP)) {
         closeConnection(conn);
-        return -1;
+        return closingSignal;
     }
 
     if (events & EPOLLIN) {
         handleRead(conn);
         if (conn->state == WRITING_RESPONSE) {
+            fprintf(stdout, "Switching to write\n");
             return EPOLLOUT;
         }
         if (conn->state == CLOSING) {
-            return -1;
+            return closingSignal;
         }
+        fprintf(stdout, "Starting read\n");
     }
 
     if (events & EPOLLOUT) {
-        handleWrite(conn);
         // Reading headers because in request loop I will go back to reading newRequest headers
+        handleWrite(conn);
         if (conn->state == READING_HEADERS) {
+            fprintf(stdout, "Switching to read\n");
             return EPOLLIN;
         }
         if (conn->state == CLOSING) {
-            return -1;
+            return closingSignal;
         }
     }
 }

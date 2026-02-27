@@ -3,6 +3,9 @@
 
 #include <stddef.h>
 
+struct connection; 
+typedef struct connection connection_t;
+
 /**
  * Structure representing a view into a buffer without ownership
  * data: Pointer to the buffer data
