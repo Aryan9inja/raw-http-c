@@ -37,7 +37,16 @@ void closeConnection(connection_t* conn) {
 
 void handleHeaders(connection_t* conn) {
     // Check for CRLF to get to header end
-    char* header_end = strstr(conn->read_buf + conn->parse_offset, "\r\n\r\n");
+    char* header_end = NULL;
+    for (size_t i = conn->parse_offset; i + 3 < conn->read_len; i++) {
+        if (conn->read_buf[i] == '\r' &&
+            conn->read_buf[i + 1] == '\n' &&
+            conn->read_buf[i + 2] == '\r' &&
+            conn->read_buf[i + 3] == '\n') {
+            header_end = conn->read_buf + conn->parse_offset + i;
+        }
+    }
+
     if (!header_end) {
         // Wait for next EPOLLIN
         fprintf(stdout, "No header end, returning\n");
@@ -50,7 +59,6 @@ void handleHeaders(connection_t* conn) {
     if (header_size > MAX_HEADER_SIZE) {
         handleParseError(MAX_HEADER_SIZE, conn);
         if (conn->state == CLOSING) {
-            closeConnection(conn);
             return;
         }
         return;
@@ -117,7 +125,6 @@ void handleRead(connection_t* conn) {
 
     // Check for states and pass onto different handlers
     if (conn->state == CLOSING) {
-        closeConnection(conn);
         return;
     }
     else if (conn->state == READING_HEADERS) {
@@ -129,14 +136,13 @@ void handleRead(connection_t* conn) {
 // I will first write about when there is parse error state
 void handleWrite(connection_t* conn) {
     conn->write_sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
-    fprintf(stdout,"Sent %zu bytes of data", conn->write_sent);
-    conn->state=CLOSING;
+    fprintf(stdout, "Sent %zu bytes of data\n", conn->write_sent);
+    conn->state = CLOSING;
 }
 
 uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
-    uint32_t closingSignal=-1;
+    uint32_t closingSignal = -1;
     if (events & (EPOLLERR | EPOLLHUP)) {
-        closeConnection(conn);
         return closingSignal;
     }
 

@@ -124,11 +124,12 @@ int main() {
                 u_int32_t epoll_events = events[i].events;
                 uint32_t mask = connectionHandler(conn, epoll_events);
 
-                if (mask == (uint32_t)-1) {
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, &events[i]) == -1) {
+                if (mask == -1) {
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL) == -1) {
                         perror("epoll_ctl: del epollin");
                         return EXIT_FAILURE;
                     }
+                    closeConnection(conn);
                     fprintf(stdout, "Epoll event deleted for request\n");
                 }
                 else {
@@ -137,7 +138,7 @@ int main() {
                     temp_ev.events = mask;
                     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &temp_ev) == -1) {
                         perror("epoll_ctl: mod epollin");
-                        connectionHandler(conn, EPOLLERR);
+                        connectionHandler(conn, EPOLLERR); // This is my invariant
                     }
                     fprintf(stdout, "Epoll event modified for request\n");
                 }
@@ -147,3 +148,5 @@ int main() {
 
     return EXIT_SUCCESS;
 }
+
+// fix uint32 using -1

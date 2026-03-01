@@ -41,6 +41,7 @@ typedef struct connection {
 }connection_t;
 
 void initializeConnection(connection_t* conn, int fd);
+void closeConnection(connection_t* conn);
 
 /**
  * @returns -1 for close, EPOLLOUT for write and EPOLLIN for read.
