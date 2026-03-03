@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#define PATH_BUFFER_CAP 8192
+
 struct connection; 
 typedef struct connection connection_t;
 
@@ -54,6 +56,10 @@ typedef struct {
     int isApi;
     bufferView_t decodedPath;
     bufferView_t normalizedPath;
+    char decodedPathBuf[PATH_BUFFER_CAP];
+    char normalizedPathBuf[PATH_BUFFER_CAP];
+    size_t decodedPathCap;
+    size_t normalizedPathCap;
 }httpInfo_t;
 
 /**

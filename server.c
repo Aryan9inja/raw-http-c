@@ -85,12 +85,6 @@ int main() {
             if (events[i].data.fd == server_fd) {
                 // Accept new connection
                 while ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) != -1) {
-                    // Configure socket to timeout after sometime
-                    // if ((setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) < 0) {
-                    //     fprintf(stderr, "Socket timeout setup failed\n");
-                    //     exit(EXIT_FAILURE);
-                    // }
-
                     // Set the client socket as non-blocking
                     int flags = fcntl(new_socket, F_GETFL, 0);
                     fcntl(new_socket, F_SETFL, flags | O_NONBLOCK);
@@ -108,7 +102,7 @@ int main() {
                     conn_ev.data.ptr = conn;
 
                     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &conn_ev) == -1) {
-                        perror("epoll_ctl: server_fd");
+                        perror("epoll_ctl: new_socket");
                         close(new_socket);
                         free(conn);
                     }
@@ -124,7 +118,7 @@ int main() {
                 u_int32_t epoll_events = events[i].events;
                 uint32_t mask = connectionHandler(conn, epoll_events);
 
-                if (mask == -1) {
+                if (mask == UINT32_MAX) {
                     if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL) == -1) {
                         perror("epoll_ctl: del epollin");
                         return EXIT_FAILURE;

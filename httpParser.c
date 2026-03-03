@@ -86,7 +86,12 @@ httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo) {
     httpInfo->isKeepAlive = 1;
     httpInfo->headerCnt = 0;
     httpInfo->isApi = 0;
+    httpInfo->decodedPath.data = httpInfo->decodedPathBuf;
     httpInfo->decodedPath.len = 0;
+    httpInfo->decodedPathCap = PATH_BUFFER_CAP;
+    httpInfo->normalizedPath.data = httpInfo->normalizedPathBuf;
+    httpInfo->normalizedPath.len = 0;
+    httpInfo->normalizedPathCap = PATH_BUFFER_CAP;
     return httpInfo;
 }
 
@@ -172,6 +177,8 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, httpInfo_t*
 
     // Parse each header line until we hit the empty line
     while (headerStart < headerEnd) {
+        if (headerCnt >= 100) return TOO_MANY_HEADERS;
+
         size_t remaining = headerEnd - headerStart;
         char* lineEnd = strstr_len(headerStart, "\r\n", remaining);
 

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include "httpParser.h"
+#include "handlers.h"
 
 #define READ_BUFFER_SIZE 4096 // 4kb
 #define MAX_HEADER_SIZE 8192 // 8kb
@@ -43,7 +44,8 @@ void handleHeaders(connection_t* conn) {
             conn->read_buf[i + 1] == '\n' &&
             conn->read_buf[i + 2] == '\r' &&
             conn->read_buf[i + 3] == '\n') {
-            header_end = conn->read_buf + conn->parse_offset + i;
+            header_end = conn->read_buf + i;
+            break;
         }
     }
 
@@ -58,9 +60,6 @@ void handleHeaders(connection_t* conn) {
     size_t header_size = conn->header_end - conn->parse_offset;
     if (header_size > MAX_HEADER_SIZE) {
         handleParseError(MAX_HEADER_SIZE, conn);
-        if (conn->state == CLOSING) {
-            return;
-        }
         return;
     }
 
@@ -82,7 +81,48 @@ void handleHeaders(connection_t* conn) {
     fprintf(stdout, "Header parsing successfull\n");
     conn->state = READING_BODY;
     // Update parse offset
-    conn->parse_offset += header_size;
+    conn->parse_offset += header_size + 3;
+}
+
+void handleBody(connection_t* conn) {
+    char* bodyStart = conn->read_buf + conn->parse_offset + 1;
+    parserResult_t bodyParserRes = bodyParser(bodyStart, &conn->request);
+    if (bodyParserRes == OK) {
+        fprintf(stdout, "Body parsed\n");
+        fprintf(stdout, "Body start at:%c\n", conn->request.body.data[0]);
+        conn->state = PROCESSING;
+    }
+    else {
+        conn->state = CLOSING;
+        return;
+    }
+}
+
+void handleRequestProcessing(connection_t* conn) {
+    // decode url
+    fprintf(stdout, "Entered parsing\n");
+    parserResult_t processingRes = OK;
+    conn->request.decodedPath.len = 0;
+    conn->request.normalizedPath.len = conn->request.normalizedPathCap;
+    processingRes = decodeUrl(&conn->request.path, &conn->request.decodedPath);
+    if (processingRes != OK) {
+        handleParseError(processingRes, conn);
+        return;
+    }
+    fprintf(stdout, "Url decoded\n");
+
+    // normalize url
+    processingRes = normalizePath(&conn->request.decodedPath, &conn->request.normalizedPath);
+    if (processingRes != OK) {
+        handleParseError(processingRes, conn);
+        return;
+    }
+    fprintf(stdout, "Decoded url normalized\n");
+
+    // Request processing
+    response_t generatedResponse = requestHandler(&conn->request, 0); // Todo add real file desc
+    fprintf(stdout, "Generated Response status code:%d\n", generatedResponse.statusCode);
+    fprintf(stdout, "Response generated\n");
 }
 
 void handleRead(connection_t* conn) {
@@ -127,21 +167,34 @@ void handleRead(connection_t* conn) {
     if (conn->state == CLOSING) {
         return;
     }
-    else if (conn->state == READING_HEADERS) {
+    if (conn->state == READING_HEADERS) {
         fprintf(stdout, "Starting header parsing\n");
         handleHeaders(conn);
+    }
+    if (conn->state == READING_BODY) {
+        fprintf(stdout, "Starting body parsing\n");
+        handleBody(conn);
+    }
+    if (conn->state == PROCESSING) {
+        fprintf(stdout, "Starting request processing\n");
+        handleRequestProcessing(conn);
     }
 }
 
 // I will first write about when there is parse error state
 void handleWrite(connection_t* conn) {
-    conn->write_sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
-    fprintf(stdout, "Sent %zu bytes of data\n", conn->write_sent);
-    conn->state = CLOSING;
+    conn->write_sent = 0;
+    while (conn->write_sent < conn->write_len) {
+        conn->write_sent += send(conn->fd, conn->write_buf, conn->write_len, 0);
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            return;
+        }
+    }
+    conn->state = CLOSING; // For now only focus is header error
 }
 
 uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
-    uint32_t closingSignal = -1;
+    uint32_t closingSignal = UINT32_MAX;
     if (events & (EPOLLERR | EPOLLHUP)) {
         return closingSignal;
     }
@@ -155,7 +208,6 @@ uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
         if (conn->state == CLOSING) {
             return closingSignal;
         }
-        fprintf(stdout, "Starting read\n");
     }
 
     if (events & EPOLLOUT) {
