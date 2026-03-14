@@ -11,6 +11,7 @@
 
 #define READ_BUFFER_SIZE 4096 // 4kb
 #define MAX_HEADER_SIZE 8192 // 8kb
+#define MIN_RESPONSE_BUFFER 65536
 
 void initializeConnection(connection_t* conn, int fd) {
     conn->fd = fd;
@@ -25,7 +26,14 @@ void initializeConnection(connection_t* conn, int fd) {
         conn->state = CLOSING;
         return;
     }
-    conn->write_buf = NULL; // so that freeing will not stop the program
+    conn->write_len = 0;
+    conn->write_sent = 0;
+    conn->write_buf = malloc(MIN_RESPONSE_BUFFER);
+    if (!conn->write_buf) {
+        perror("Malloc failed");
+        conn->state = CLOSING;
+        return;
+    }
     fprintf(stdout, "Connection Initialized\n");
 }
 
@@ -123,6 +131,10 @@ void handleRequestProcessing(connection_t* conn) {
     response_t generatedResponse = requestHandler(&conn->request, 0); // Todo add real file desc
     fprintf(stdout, "Generated Response status code:%d\n", generatedResponse.statusCode);
     fprintf(stdout, "Response generated\n");
+
+    createWritableResponse(&generatedResponse, &conn->write_buf, &conn->write_len);
+    fprintf(stdout, "Changing state to write\n");
+    conn->state = WRITING_RESPONSE;
 }
 
 void handleRead(connection_t* conn) {
@@ -183,14 +195,16 @@ void handleRead(connection_t* conn) {
 
 // I will first write about when there is parse error state
 void handleWrite(connection_t* conn) {
-    conn->write_sent = 0;
     while (conn->write_sent < conn->write_len) {
-        conn->write_sent += send(conn->fd, conn->write_buf, conn->write_len, 0);
-        if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            return;
+        ssize_t sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
+        if (sent < 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                conn->state = CLOSING;
+                return;
+            }
         }
+        conn->write_sent += sent;
     }
-    conn->state = CLOSING; // For now only focus is header error
 }
 
 uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
