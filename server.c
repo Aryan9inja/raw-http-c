@@ -91,7 +91,7 @@ int main() {
 
                     // Add the new socket to epoll
                     connection_t* conn = malloc(sizeof(connection_t));
-                    initializeConnection(conn, new_socket);
+                    initializeConnection(conn, new_socket, docroot_fd);
 
                     if (conn->state != READING_HEADERS) {
                         exit(EXIT_FAILURE);

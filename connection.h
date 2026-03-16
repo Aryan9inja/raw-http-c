@@ -33,14 +33,15 @@ typedef struct connection {
     size_t write_sent;
 
     // file sending
-    int file_fd;
+    int root_fd;   // root directory fd, never overwritten
+    int file_fd;   // per-request opened file fd
     off_t file_offset;
     size_t file_remaining;
 
     httpInfo_t request;
 }connection_t;
 
-void initializeConnection(connection_t* conn, int fd);
+void initializeConnection(connection_t* conn, int fd, int fileRootFd);
 void closeConnection(connection_t* conn);
 
 /**

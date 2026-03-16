@@ -7,13 +7,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include "httpParser.h"
+#include <sys/sendfile.h>
 #include "handlers.h"
 
 #define READ_BUFFER_SIZE 4096 // 4kb
 #define MAX_HEADER_SIZE 8192 // 8kb
 #define MIN_RESPONSE_BUFFER 65536
 
-void initializeConnection(connection_t* conn, int fd) {
+void initializeConnection(connection_t* conn, int fd, int fileRootFd) {
     conn->fd = fd;
     conn->state = READING_HEADERS;
     conn->header_end = 0;
@@ -34,11 +35,18 @@ void initializeConnection(connection_t* conn, int fd) {
         conn->state = CLOSING;
         return;
     }
+    conn->root_fd = fileRootFd;
+    conn->file_fd = -1;
+    conn->file_offset = 0;
+    conn->file_remaining = 0;
     fprintf(stdout, "Connection Initialized\n");
 }
 
 void closeConnection(connection_t* conn) {
     close(conn->fd);
+    if (conn->file_fd != conn->root_fd) {
+        close(conn->file_fd);
+    }
     free(conn->read_buf);
     free(conn->write_buf);
     free(conn);
@@ -128,12 +136,16 @@ void handleRequestProcessing(connection_t* conn) {
     fprintf(stdout, "Decoded url normalized\n");
 
     // Request processing
-    response_t generatedResponse = requestHandler(&conn->request, 0); // Todo add real file desc
+    response_t generatedResponse = requestHandler(&conn->request, conn->root_fd);
     fprintf(stdout, "Generated Response status code:%d\n", generatedResponse.statusCode);
     fprintf(stdout, "Response generated\n");
 
     createWritableResponse(&generatedResponse, &conn->write_buf, &conn->write_len);
     fprintf(stdout, "Changing state to write\n");
+    if(!conn->request.isApi){
+        conn->file_fd=generatedResponse.fileDescriptor;
+        conn->file_remaining=generatedResponse.fileSize;
+    }
     conn->state = WRITING_RESPONSE;
 }
 
@@ -193,8 +205,7 @@ void handleRead(connection_t* conn) {
     }
 }
 
-// I will first write about when there is parse error state
-void handleWrite(connection_t* conn) {
+void handleSend(connection_t* conn) {
     while (conn->write_sent < conn->write_len) {
         ssize_t sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
         if (sent < 0) {
@@ -204,6 +215,44 @@ void handleWrite(connection_t* conn) {
             }
         }
         conn->write_sent += sent;
+    }
+    if (!conn->request.isApi) {
+        conn->state = SENDING_FILE;
+        fprintf(stdout,"Changing state to file\n");
+        return;
+    }
+    conn->state = READING_HEADERS;
+}
+
+void handleFileSend(connection_t* conn) {
+    fprintf(stdout,"Entered handleFileSend\n");
+    off_t offset = 0;
+    size_t remainingFileSize = conn->file_remaining;
+    fprintf(stdout,"Remaining = %zu\n",remainingFileSize);
+    while (remainingFileSize > 0) {
+        size_t byteCount = remainingFileSize;
+        ssize_t sent = sendfile(conn->fd, conn->file_fd, &offset, byteCount);
+
+        if (sent <= 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            conn->state = CLOSING;
+            return;
+        }
+
+        remainingFileSize -= sent;
+    }
+    close(conn->file_fd);
+    conn->file_fd = conn->root_fd;
+    conn->state = READING_HEADERS;
+}
+
+// I will first write about when there is parse error state
+void handleWrite(connection_t* conn) {
+    if (conn->state == WRITING_RESPONSE) {
+        handleSend(conn);
+    }
+    if (conn->state == SENDING_FILE) {
+        handleFileSend(conn);
     }
 }
 

@@ -261,23 +261,6 @@ void addBody(response_t* response, char* responseBuffer) {
     memcpy(responseBuffer, response->body, response->bodyLen);
 }
 
-requestResponse_t sendFileStream(int socket, response_t* response) {
-    off_t offset = 0;
-    size_t remainingFileSize = response->fileSize;
-    while (remainingFileSize > 0) {
-        size_t byteCount = remainingFileSize;
-        ssize_t sent = sendfile(socket, response->fileDescriptor, &offset, byteCount);
-
-        if (sent <= 0) {
-            if (errno == EAGAIN || errno == EINTR) continue;
-            return FILE_SEND_ERROR;
-        }
-
-        remainingFileSize -= sent;
-    }
-    return Ok;
-}
-
 void createWritableResponse(response_t* response, char** responseBuffer, size_t* responseBufferLen) {
     size_t headerLen = generateResponseHeaders(response, *responseBuffer);
     size_t bodyLen = response->bodyLen;
