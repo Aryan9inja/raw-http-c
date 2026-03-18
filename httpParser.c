@@ -3,6 +3,53 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "httpParser.h"
+#include "connection.h"
+
+error_entry_t error_table[] = {
+    {BAD_REQUEST_LINE,400,"Bad Request"},
+    {BAD_HEADER_SYNTAX,400,"Bad Header Syntax"},
+    {INVALID_VERSION,505,"HTTP Version Not Supported"},
+    {INVALID_CONTENT_LENGTH,400,"Invalid Content Length"},
+    {BODY_NOT_ALLOWED,400,"Body not allowed"},
+    {MISSING_REQUIRED_HEADERS,400,"Missing Required Headers"},
+    {UNSUPPORTED_TRANSFER_ENCODING, 501,"Not Implemented"},
+    {UNSUPPORTED_METHOD,405,"Method Not Allowed"},
+    {HEADER_TOO_LARGE,431,"Request Header Fields Too Large"},
+    {TOO_MANY_HEADERS,400,"Too Many Headers"},
+    {PAYLOAD_TOO_LARGE,413,"Payload Too Large"},
+    {REQUEST_TIMEOUT,408,"Request Timeout"},
+    {BAD_REQUEST_PATH,400,"Bad Path For Request"}
+};
+
+// Handle parser errors
+void handleParseError(parserResult_t res, connection_t* conn) {
+    int status = 400; // Default fallback
+    char* msg = "Bad Request";
+
+    // Loop through the table to find the specific error
+    for (size_t i = 0; i < sizeof(error_table) / sizeof(error_table[0]); i++) {
+        if (error_table[i].result == res) {
+            status = error_table[i].status_code;
+            msg = error_table[i].status_text;
+            break;
+        }
+    }
+
+    conn->write_buf = malloc(256);
+    if (!conn->write_buf) {
+        perror("Malloc failed");
+        conn->state = CLOSING;
+        return;
+    }
+    conn->write_len = snprintf(conn->write_buf, 256,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n",
+        status, msg);
+
+    conn->write_sent = 0;
+    conn->state = WRITING_RESPONSE;
+}
 
 // Custom strstr that respects a maximum length instead of relying on null-terminator
 char* strstr_len(const char* haystack, const char* needle, size_t len) {
@@ -39,7 +86,12 @@ httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo) {
     httpInfo->isKeepAlive = 1;
     httpInfo->headerCnt = 0;
     httpInfo->isApi = 0;
+    httpInfo->decodedPath.data = httpInfo->decodedPathBuf;
     httpInfo->decodedPath.len = 0;
+    httpInfo->decodedPathCap = PATH_BUFFER_CAP;
+    httpInfo->normalizedPath.data = httpInfo->normalizedPathBuf;
+    httpInfo->normalizedPath.len = 0;
+    httpInfo->normalizedPathCap = PATH_BUFFER_CAP;
     return httpInfo;
 }
 
@@ -57,7 +109,7 @@ void checkIfApi(httpInfo_t* httpInfo) {
     }
 }
 
-parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo) {
+parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, httpInfo_t* uninitializedHttpInfo) {
     httpInfo_t* httpInfo = initializeHttpInfo(uninitializedHttpInfo);
 
     // Find the end of the first line (request line)
@@ -111,8 +163,8 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
     }
 
     // HTTP/1.0 is not reliable for keep alive 
-    if(strncmp(versionStart, "HTTP/1.0", 8) == 0){
-        httpInfo->isKeepAlive=0;
+    if (strncmp(versionStart, "HTTP/1.0", 8) == 0) {
+        httpInfo->isKeepAlive = 0;
     }
 
     // ---- Parsing Headers ----
@@ -121,10 +173,12 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
         return MISSING_REQUIRED_HEADERS;
     }
     size_t headerCnt = 0;
-    httpInfo->headers = headerArray;
+    // httpInfo->headers = headerArray; Not needed as we allocate array on stack
 
     // Parse each header line until we hit the empty line
     while (headerStart < headerEnd) {
+        if (headerCnt >= 100) return TOO_MANY_HEADERS;
+
         size_t remaining = headerEnd - headerStart;
         char* lineEnd = strstr_len(headerStart, "\r\n", remaining);
 
@@ -196,7 +250,6 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* h
 
     // Validate: GET requests should not have a body
     if (httpInfo->method.data[0] == 'G' && httpInfo->contentLength != 0) {
-        printf("The content length is %zu\n", httpInfo->contentLength);
         return BODY_NOT_ALLOWED;
     }
 

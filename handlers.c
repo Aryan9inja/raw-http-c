@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <errno.h>
 
-#define RESPONSE_BUFFER_SIZE 16384
+#define RESPONSE_BUFFER_SIZE 65536
 
 // Initialize a response structure with default values
 response_t initializeResponse() {
@@ -171,7 +171,6 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
         return;
     }
 
-    printf("Serving file: %s\n", relativePath);
     getFileType(relativePath, response);
     free(relativePath);
 
@@ -242,7 +241,7 @@ response_t requestHandler(httpInfo_t* httpInfo, int root_fd) {
     return response;
 }
 
-requestResponse_t sendHeaders(int socket, response_t* response, char* responseBuffer) {
+size_t generateResponseHeaders(response_t* response, char* responseBuffer) {
     char* connectionString = response->shouldClose ? "close" : "keep-alive";
     size_t contentLength = response->fileDescriptor != -1 ? response->fileSize : response->bodyLen;
 
@@ -254,92 +253,17 @@ requestResponse_t sendHeaders(int socket, response_t* response, char* responseBu
         "Connection: %s\r\n\r\n",
         response->statusCode, response->statusText, contentLength, response->contentType, connectionString);
 
-    size_t sentOffset = 0;
-    size_t remaining = headerLen;
-    while (remaining > 0) {
-        ssize_t bytesSent = send(socket, responseBuffer + sentOffset, remaining, 0);
-        if (bytesSent <= 0) {
-            if (errno == EINTR) continue;
-            return HEADER_SEND_ERROR;
-        }
-        remaining -= bytesSent;
-        sentOffset += bytesSent;
-    }
-
-    return Ok;
+    return headerLen;
 }
 
-requestResponse_t sendBody(int socket, response_t* response, char* responseBuffer) {
+void addBody(response_t* response, char* responseBuffer) {
     memcpy(responseBuffer, response->body, response->bodyLen);
-    size_t responseLen = response->bodyLen;
-
-    size_t sentOffset = 0;
-    size_t remaining = responseLen;
-    while (remaining > 0) {
-        ssize_t bytesSent = send(socket, responseBuffer + sentOffset, remaining, 0);
-        if (bytesSent <= 0) {
-            if (errno == EINTR) continue;
-            return BODY_SEND_ERROR;
-        }
-        remaining -= bytesSent;
-        sentOffset += bytesSent;
-    }
-    return Ok;
 }
 
-requestResponse_t sendFileStream(int socket, response_t* response) {
-    off_t offset = 0;
-    size_t remainingFileSize = response->fileSize;
-    while (remainingFileSize > 0) {
-        size_t byteCount = remainingFileSize;
-        ssize_t sent = sendfile(socket, response->fileDescriptor, &offset, byteCount);
-
-        if (sent <= 0) {
-            if (errno == EAGAIN || errno == EINTR) continue;
-            return FILE_SEND_ERROR;
-        }
-
-        remainingFileSize -= sent;
-    }
-    return Ok;
-}
-
-requestResponse_t sendResponse(int socket, response_t* response) {
-    requestResponse_t result = Ok;
-    char responseBuffer[RESPONSE_BUFFER_SIZE];
-
-    requestResponse_t headerResult = sendHeaders(socket, response, responseBuffer);
-    if (headerResult != Ok) {
-        fprintf(stdout, "Header sending failed");
-        result = headerResult;
-        goto cleanup;
-    }
-
-    if (response->fileDescriptor != -1) {
-        requestResponse_t fileResult = sendFileStream(socket, response);
-        if (fileResult != Ok) {
-            fprintf(stdout, "File sending failed");
-            result = fileResult;
-            goto cleanup;
-        }
-    }
-    else {
-        requestResponse_t bodyResult = sendBody(socket, response, responseBuffer);
-        if (bodyResult != Ok) {
-            fprintf(stdout, "Body sending failed");
-            result = bodyResult;
-            goto cleanup;
-        }
-    }
-
-cleanup:
-    if (response->fileDescriptor != -1) {
-        close(response->fileDescriptor);
-    }
-    if (response->bodyLen > 0) {
-        free(response->body);
-    }
-
-    printf("%d",response->statusCode);
-    return result;
+void createWritableResponse(response_t* response, char** responseBuffer, size_t* responseBufferLen) {
+    size_t headerLen = generateResponseHeaders(response, *responseBuffer);
+    size_t bodyLen = response->bodyLen;
+    addBody(response , *responseBuffer+headerLen);
+    free(response->body);
+    *responseBufferLen=headerLen+bodyLen;
 }

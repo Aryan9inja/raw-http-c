@@ -3,6 +3,11 @@
 
 #include <stddef.h>
 
+#define PATH_BUFFER_CAP 8192
+
+struct connection; 
+typedef struct connection connection_t;
+
 /**
  * Structure representing a view into a buffer without ownership
  * data: Pointer to the buffer data
@@ -40,7 +45,9 @@ typedef struct {
     bufferView_t path;
     bufferView_t version;
     size_t headerCnt;
-    header_t* headers;
+    // header_t* headers; This worked well in blocking phase where we allocated it on heap
+    // For simplicity, I will just use stack for now for each request
+    header_t headers[100];
     size_t contentLength;
     bufferView_t contentType;
     int isContentLengthSeen;
@@ -49,6 +56,10 @@ typedef struct {
     int isApi;
     bufferView_t decodedPath;
     bufferView_t normalizedPath;
+    char decodedPathBuf[PATH_BUFFER_CAP];
+    char normalizedPathBuf[PATH_BUFFER_CAP];
+    size_t decodedPathCap;
+    size_t normalizedPathCap;
 }httpInfo_t;
 
 /**
@@ -71,15 +82,20 @@ typedef enum {
     BAD_REQUEST_PATH
 }parserResult_t;
 
+typedef struct {
+    parserResult_t result;
+    int status_code;
+    char* status_text;
+} error_entry_t;
+
 /**
  * Parses HTTP request line and headers from buffer
  * @param buffer Pointer to the start of the request data
  * @param headerEnd Pointer to the end of headers (\r\n\r\n)
- * @param headerArray Pre-allocated array to store parsed headers
  * @param uninitializedHttpInfo Pointer to httpInfo_t structure to populate
  * @return parserResult_t indicating success (OK) or specific error
  */
-parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo);
+parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, httpInfo_t* uninitializedHttpInfo);
 
 /**
  * Parses HTTP request body
@@ -92,5 +108,7 @@ parserResult_t bodyParser(char* bodyStart, httpInfo_t* httpInfo);
 parserResult_t decodeUrl(bufferView_t* requestPath, bufferView_t* decodedPath);
 
 parserResult_t normalizePath(bufferView_t* decodedPath, bufferView_t* normalizedPath);
+
+void handleParseError(parserResult_t res, connection_t* conn);
 
 #endif

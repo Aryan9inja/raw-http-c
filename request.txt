@@ -1,0 +1,20 @@
+# Curl config file for testing multiple requests on single connection
+
+# Enable connection keep-alive
+keepalive-time = 60
+
+# First request: GET /api
+url = "http://localhost:8080/api"
+request = GET
+
+# Move to next request while keeping connection alive
+next
+
+# Second request: POST /api/echo
+url = "http://localhost:8080/api/echo"
+request = POST
+header = "Content-Type: application/json"
+data = "{\"message\": \"test\"}"
+
+# Verbose output to see connection details
+verbose

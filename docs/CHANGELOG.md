@@ -1,5 +1,115 @@
 # Changelog
 
+## [v0.5] - 2026-03-18
+
+### Added
+- **Event-Driven Architecture**: Complete rewrite from process-based to epoll-based I/O multiplexing
+  - Single-process event loop using Linux `epoll()` for efficient I/O monitoring
+  - Non-blocking sockets (`O_NONBLOCK`) for server and all client connections
+  - Per-connection state machine tracking request-response lifecycle
+  - C10K capable: Handles 10,000+ concurrent connections efficiently
+  - Eliminates fork() overhead (no process creation per connection)
+  - Memory-efficient: ~68KB per idle connection (vs. full process in v0.4)
+- **Connection Module**: New `connection.c/h` implementing state machine
+  - `connection_t` structure tracks all per-connection state
+  - Six states: `READING_HEADERS`, `READING_BODY`, `PROCESSING`, `WRITING_RESPONSE`, `SENDING_FILE`, `CLOSING`
+  - `connectionHandler()`: Main event dispatcher for connection state transitions
+  - `initializeConnection()` / `closeConnection()`: Lifecycle management
+  - State handlers: `handleRead()`, `handleHeaders()`, `handleBody()`, `handleRequestProcessing()`, `handleWrite()`, `handleFileSend()`
+  - `resetConnection()`: Keep-alive support (reset state for next request)
+  - Incremental I/O: Handles partial reads/writes across multiple epoll events
+- **Non-Blocking I/O Patterns**: Proper EAGAIN/EWOULDBLOCK handling
+  - Read loops drain socket until EAGAIN
+  - Write loops handle partial sends, return EPOLLOUT on buffer full
+  - sendfile() for static files works with non-blocking semantics
+- **Epoll Event Loop**: Efficient event multiplexing in `server.c`
+  - `epoll_create()`: Initialize epoll instance at startup
+  - Server socket registered with EPOLLIN for accept events
+  - Non-blocking accept() loop drains all pending connections
+  - Client sockets registered with dynamic interests (EPOLLIN/EPOLLOUT)
+  - `EPOLL_CTL_MOD` updates interest based on state transitions
+  - `EPOLL_CTL_DEL` removes connection when state is CLOSING
+
+### Changed
+- **Server Architecture**: Simplified from fork-based to single-process event loop
+  - Removed SIGCHLD handler and zombie process reaping (no child processes)
+  - Removed socket timeout configuration (replaced with non-blocking I/O)
+  - Server socket set to non-blocking mode
+  - Listen backlog increased from 3 to 50 connections
+- **Handler Interface**: Separated response generation from transmission
+  - Removed `sendResponse()`, `sendHeaders()`, `sendBody()`, `sendFileStream()` functions
+  - New `createWritableResponse()`: Formats complete response into buffer
+  - New `generateResponseHeaders()`: Returns header length (doesn't send)
+  - New `addBody()`: Appends body to buffer after headers
+  - Handlers are now synchronous (no socket I/O, no blocking)
+  - Connection module handles all write() and sendfile() operations
+- **Parser Integration**: Moved error handling to httpParser.c
+  - `handleParseError()` moved from server.c to httpParser.c
+  - Takes `connection_t*` parameter instead of socket fd
+  - Formats error responses into `connection->write_buf` (no direct I/O)
+  - Sets connection state to `WRITING_RESPONSE` for error transmission
+- **Memory Model**: Embedded buffers in httpInfo_t
+  - `decodedPathBuf[8192]` and `normalizedPathBuf[8192]` embedded in structure
+  - Headers array `headers[100]` embedded (no separate allocation)
+  - Path buffers initialized in `initializeHttpInfo()` to point to embedded arrays
+  - Reduces heap allocations and improves cache locality
+
+### Improved
+- **Performance**: Significant throughput and latency improvements
+  - 38% higher request rate vs v0.4 (14,300 req/sec vs 10,300 req/sec)
+  - 30% lower mean latency (0.7ms vs 1.0ms)
+  - Single-process architecture eliminates fork() and context switch overhead
+  - Minimal idle memory per connection (~68KB vs full process)
+- **Scalability**: C10K problem solved
+  - v0.4: Limited by OS process limits (~10K-100K processes max)
+  - v0.5: Handles 10,000+ concurrent connections with single process
+  - No thread/process creation per connection
+  - Efficient epoll scaling (O(1) event notification)
+- **Request Pipelining**: Better support for pipelined requests
+  - Read buffer preserves unparsed data across keep-alive resets
+  - `resetConnection()` immediately processes pipelined requests if in buffer
+  - No blocking delays between pipelined requests
+
+### Removed
+- **Process-Based Concurrency**: fork() model replaced with event-driven
+  - No more parent-child process model
+  - No SIGCHLD handler or zombie process management
+  - No copy-on-write semantics or process isolation
+- **Blocking I/O**: All I/O now non-blocking
+  - Removed socket read timeout (SO_RCVTIMEO)
+  - Removed blocking send() loops from handlers
+  - Handlers no longer touch sockets directly
+
+### Technical Details
+- **Buffer Management**: Dynamic per-connection buffers
+  - Read buffer: 4KB initial, grows as needed, 8KB max for headers
+  - Write buffer: 64KB for response headers/body
+  - Buffers reused across keep-alive requests
+- **File Descriptor Management**:
+  - Document root fd opened once at startup, shared across all connections
+  - Per-request file fd opened in PROCESSING, closed after SENDING_FILE
+  - Connection structure tracks both root_fd and file_fd
+- **Keep-Alive Implementation**: State reset instead of connection close
+  - After response complete, `resetConnection()` called if !shouldClose
+  - Shifts unparsed data to buffer start with memmove()
+  - Resets state to READING_HEADERS and continues
+  - Closes connection only when shouldClose flag set or error occurs
+
+### Documentation
+- **New Files**:
+  - `docs/connection.md`: Comprehensive connection state machine documentation
+- **Updated Files**:
+  - `README.md`: Event-driven architecture description and v0.5 features
+  - `docs/server.md`: Complete rewrite for epoll event loop model
+  - `docs/handlers.md`: Updated for buffer-based interface
+  - `docs/httpParser.md`: Integration with connection state machine
+
+### Known Limitations
+- **Linux-Only**: Uses epoll (not portable to BSD/macOS without kqueue port)
+- **Single-Threaded**: All I/O handled in one thread (CPU-bound operations block event loop)
+- **No Connection Limits**: Unlimited concurrent connections (limited by OS fd limits)
+- **No Idle Timeouts**: Connections persist indefinitely (TODO: add timeout mechanism)
+
 ## [v0.4] - 2026-02-12
 
 ### Added

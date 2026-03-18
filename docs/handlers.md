@@ -2,28 +2,29 @@
 
 ## Overview
 
-`handlers.c` implements request routing, response generation, and transmission for the HTTP/1.1 server. It receives parsed requests from `httpParser.c`, matches them to appropriate handlers (API vs static files), generates responses with correct status codes and headers, and transmits responses back to clients using zero-copy `sendfile()` for files.
+`handlers.c` implements request routing and response generation for the HTTP/1.1 server. It receives parsed requests from `httpParser.c`, matches them to appropriate handlers (API vs static files), and generates response data into buffers. **Handlers no longer send data directly to sockets** - all I/O is delegated to `connection.c`, enabling a clean separation between response generation and transmission.
 
-### v0.4 Status
-Major enhancements for **static file serving** and **Content-Type support**:
-- **Static File Handler**: Serves files from `public/` directory with zero-copy `sendfile()`
-- **Content-Type Detection**: Automatic MIME type mapping based on file extensions
-- **API vs File Routing**: Requests with `/api/` prefix handled separately from static files
-- **Enhanced Error Responses**: 404 with body, 403 for forbidden files, 500 for server errors
-- **Separate Send Paths**: `sendHeaders()`, `sendBody()`, `sendFileStream()` for optimized transmission
-- Process model unchanged: Each child process serves files independently with no shared state
+### v0.5 Status
+Major architectural refactoring for **event-driven architecture**:
+- **Buffer-Based Interface**: Responses formatted into memory buffers, not sent directly
+- **No Socket I/O in Handlers**: All `send()` and `sendfile()` calls moved to `connection.c`
+- **Synchronous Handlers**: No blocking I/O operations - handlers are pure data generation
+- **Simplified API**: Three functions replace old send functions: `createWritableResponse()`, `generateResponseHeaders()`, `addBody()`
+- **Separation of Concerns**: Handler layer generates data, connection layer handles transmission
+- **Static File Serving**: File descriptor passed to connection layer for zero-copy `sendfile()`
+- **Content-Type Detection**: Automatic MIME type mapping based on file extensions (unchanged)
+- **API vs File Routing**: Requests with `/api/` prefix handled separately from static files (unchanged)
 
 ## Key Responsibilities
 
 1. **Request Routing**: Route to API handlers or static file serving based on `/api/` prefix
-2. **Static File Serving**: Serve files from `public/` directory with zero-copy `sendfile()`
+2. **Static File Serving**: Open files from `public/` directory and prepare file metadata
 3. **Content-Type Detection**: Determine MIME type from file extensions
-4. **Response Generation**: Create response bodies for APIs or metadata for files
+4. **Response Body Generation**: Create response bodies for API endpoints
 5. **Status Code Management**: Set appropriate HTTP status codes (200, 404, 403, 405, 500)
 6. **Keep-Alive State Propagation**: Mirror connection state from request to response
-7. **Response Formatting**: Format HTTP response headers with Content-Type and Content-Length
-8. **Response Transmission**: Send headers + body/file via separate optimized paths
-9. **Memory Management**: Allocate and free response bodies, close file descriptors
+7. **Response Buffer Formatting**: Format HTTP headers and body into memory buffers
+8. **Memory Management**: Allocate response bodies, prepare buffer for transmission (no socket I/O)
 
 ## Core Data Structures
 
@@ -47,16 +48,16 @@ typedef struct {
 - `fileSize`: File size from `fstat()`, used for Content-Length header
 - `contentType`: MIME type string (literal), determines Content-Type header
 
-**Memory Ownership:**
-- `body`: Heap-allocated via `malloc()` if non-NULL (API responses)
+**Memory Ownership (v0.5 Updated):**
+- `body`: Heap-allocated via `malloc()` if non-NULL (API responses) - freed by `createWritableResponse()`
 - `statusText`: Points to string literal (no allocation)
 - `contentType`: Points to string literal (no allocation)
-- `fileDescriptor`: Opened by `fileHandler()`, closed by `sendResponse()`
-- Caller must free `body` and close `fileDescriptor` after transmission (done in `sendResponse()`)
+- `fileDescriptor`: Opened by `fileHandler()`, closed by connection layer after `sendfile()`
+- Response buffer allocated and managed by connection layer
 
 **Response Type Indicator:**
-- If `fileDescriptor != -1`: Static file response (use `sendFileStream()`)
-- If `body != NULL`: API response (use `sendBody()`)
+- If `fileDescriptor != -1`: Static file response (connection layer uses `sendfile()`)
+- If `body != NULL`: API response (formatted into buffer by `createWritableResponse()`)
 - Mutually exclusive: never both set simultaneously
 
 ### `responseHeaders_t`
@@ -312,11 +313,11 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd);
 6. **Response Setup:**
    - Set `statusCode = 200`, `statusText = "OK"`
    - Set `fileSize = fileStat.st_size` (for Content-Length)
-   - Set `fileDescriptor = staticFile_fd` (kept open for `sendfile()`)
+   - Set `fileDescriptor = staticFile_fd` (kept open, passed to connection layer)
 
 7. **Memory Management:**
    - Free `relativePath` buffer after use
-   - File descriptor ownership transferred to `response` (closed in `sendResponse()`)
+   - File descriptor ownership transferred to `response` (closed by connection layer after `sendfile()`)
 
 **Security:**
 - `openat()` with base directory FD prevents path traversal
@@ -415,17 +416,19 @@ Inverts keep-alive flag: `isKeepAlive=0` → `shouldClose=1`.
 - Path comparison is case-sensitive
 
 **Return Value:**
-Returns `response_t` struct (value semantics, not pointer).
+Returns `response_t` struct (value semantics, not pointer). Response struct passed to connection layer for I/O operations.
 
-### `sendHeaders()`
-Sends HTTP status line and headers to client socket.
+## Response Buffer Generation Functions (v0.5)
+
+### `generateResponseHeaders()`
+Formats HTTP status line and headers into a response buffer.
 
 **Signature:**
 ```c
-requestResponse_t sendHeaders(int socket, response_t* response, char* responseBuffer);
+size_t generateResponseHeaders(response_t* response, char* responseBuffer);
 ```
 
-**Headers Sent:**
+**Headers Generated:**
 ```
 HTTP/1.1 <statusCode> <statusText>\r\n
 Content-Length: <bodyLen or fileSize>\r\n
@@ -442,176 +445,208 @@ Connection: <keep-alive|close>\r\n
 - `"close"` if `shouldClose == 1`
 - `"keep-alive"` if `shouldClose == 0`
 
-**Partial Write Handling:**
-Implements retry loop for partial writes:
-```c
-while (remaining > 0) {
-    ssize_t bytesSent = send(socket, responseBuffer + sentOffset, remaining, 0);
-    if (bytesSent <= 0) {
-        if (errno == EINTR) continue;  // Interrupted, retry
-        return HEADER_SEND_ERROR;
-    }
-    remaining -= bytesSent;
-    sentOffset += bytesSent;
-}
-```
-
-**Return Values:**
-- `Ok`: All headers sent successfully
-- `HEADER_SEND_ERROR`: Send failed (network error, closed socket)
-
 **Buffer Usage:**
-Formats headers into provided `responseBuffer` (16KB), then sends.
+Formats headers into provided `responseBuffer` using `snprintf()` (max 65536 bytes).
 
-### `sendBody()`
-Sends malloc'd response body (for API responses).
+**Return Value:**
+Returns the length of the formatted headers (size_t). This length is used to position body data after headers.
 
-**Signature:**
-```c
-requestResponse_t sendBody(int socket, response_t* response, char* responseBuffer);
-```
+**Key Change (v0.5):**
+Does **not** send to socket - only formats into buffer. Connection layer handles actual `send()` call.
 
-**Steps:**
-1. Copy `response->body` to `responseBuffer` with `memcpy()`
-2. Send buffer contents to socket
-3. Implement partial write retry loop (same as `sendHeaders()`)
-
-**Return Values:**
-- `Ok`: All body bytes sent successfully
-- `BODY_SEND_ERROR`: Send failed
-
-**When Used:**
-Only called when `response->fileDescriptor == -1` (API responses, not files).
-
-**Partial Write Handling:**
-Same retry loop pattern as `sendHeaders()` (handles `EINTR`, tracks offset).
-
-### `sendFileStream()`
-Sends file contents using zero-copy `sendfile()` syscall.
+### `addBody()`
+Appends response body to buffer after headers.
 
 **Signature:**
 ```c
-requestResponse_t sendFileStream(int socket, response_t* response);
+void addBody(response_t* response, char* responseBuffer);
 ```
 
-**Zero-Copy Mechanism:**
+**Operation:**
+Copies `response->body` to `responseBuffer` using `memcpy()` for `bodyLen` bytes.
+
+**Preconditions:**
+- `responseBuffer` must point to position after headers (header length offset)
+- `response->body` must be allocated and contain valid data
+- `response->bodyLen` must match allocated body size
+
+**Usage Pattern:**
 ```c
-off_t offset = 0;
-size_t remainingFileSize = response->fileSize;
-while (remainingFileSize > 0) {
-    ssize_t sent = sendfile(socket, response->fileDescriptor, &offset, remainingFileSize);
-    if (sent <= 0) {
-        if (errno == EAGAIN || errno == EINTR) continue;
-        return FILE_SEND_ERROR;
-    }
-    remainingFileSize -= sent;
-}
+size_t headerLen = generateResponseHeaders(&response, buffer);
+addBody(&response, buffer + headerLen);
 ```
 
-**sendfile() Advantages:**
-- **No User-Space Buffer**: File data transferred directly from kernel page cache to socket
-- **Reduced System Calls**: Single `sendfile()` vs. multiple `read()` + `write()` pairs
-- **CPU Efficiency**: Eliminates memory copy operations (zero-copy)
-- **Page Cache Benefit**: Frequently accessed files served from cache (no disk I/O)
+**Key Change (v0.5):**
+Does **not** send to socket - only copies data into buffer. Connection layer handles transmission.
 
-**Partial Transfer Handling:**
-- Loop until all `fileSize` bytes sent
-- Tracks `offset` (automatically updated by `sendfile()`)
-- Handles `EAGAIN` (would block on non-blocking socket - not used currently)
-- Handles `EINTR` (interrupted by signal)
-
-**Return Values:**
-- `Ok`: All file bytes sent successfully
-- `FILE_SEND_ERROR`: `sendfile()` failed (socket closed, file error)
-
-**When Used:**
-Only called when `response->fileDescriptor != -1` (static file responses).
-
-**Comparison to read+write Approach:**
-```
-read+write:  File → Kernel buffer → User buffer → Kernel buffer → Socket
-sendfile:    File → Kernel buffer ─────────────────────────────→ Socket
-```
-Eliminates one kernel→user→kernel copy round-trip.
-
-### `sendResponse()`
-Master function that coordinates header and body/file transmission.
+### `createWritableResponse()`
+Master function that creates a complete response buffer ready for transmission.
 
 **Signature:**
 ```c
-requestResponse_t sendResponse(int socket, response_t* response);
+void createWritableResponse(response_t* response, char** responseBuffer, size_t* responseBufferLen);
 ```
 
-**Flow Diagram:**
+**Parameters:**
+- `response`: Response struct with status, body, and metadata
+- `responseBuffer`: Pointer to buffer (pre-allocated by caller, typically 65536 bytes)
+- `responseBufferLen`: Output parameter, receives total buffer length (headers + body)
+
+**Operation Flow:**
 ```
 ┌──────────────────────────────┐
-│ sendHeaders(socket, response)│
+│ generateResponseHeaders()    │
+│ → formats headers into buffer│
+│ → returns headerLen          │
 └──────────────┬───────────────┘
-               │
-        ┌──────┴──────┐
-    SUCCESS          FAIL
-        │              │
-        ▼              ▼
-    ┌──────────────┐  ┌───────────────┐
-    │fileDescriptor│  │Return         │
-    │!= -1?        │  │HEADER_SEND_   │
-    └───┬──────┬───┘  │ERROR          │
-   YES  │      │ NO   └───────────────┘
-        ▼      ▼
-    ┌────────┐ ┌────────────┐
-    │sendFile│ │sendBody()  │
-    │Stream()│ │            │
-    └────┬───┘ └─────┬──────┘
-         │           │
-         └─────┬─────┘
                ▼
-       ┌───────────────┐
-       │ cleanup:      │
-       │ - close(fd)   │
-       │ - free(body)  │
-       └───┬───────────┘
-           ▼
-       ┌─────────┐
-       │ Return  │
-       │ result  │
-       └─────────┘
+   ┌───────────────────────────┐
+   │ addBody()                 │
+   │ → copies body after headers│
+   └──────────────┬────────────┘
+                  ▼
+        ┌─────────────────────┐
+        │ free(response->body)│
+        │ → cleanup body alloc│
+        └──────────┬──────────┘
+                   ▼
+   ┌──────────────────────────────┐
+   │ Set responseBufferLen =      │
+   │ headerLen + bodyLen          │
+   └──────────────────────────────┘
 ```
 
-**Steps:**
-1. **Send Headers**: Call `sendHeaders()` to transmit HTTP status and headers
-   - On failure: Jump to cleanup, return error code
+**Memory Management:**
+- **Frees** `response->body` after copying to buffer (single allocation, freed here)
+- Buffer itself is managed by connection layer (not allocated/freed here)
+- For file responses (`fileDescriptor != -1`), body is NULL and not copied
 
-2. **Send Content** (conditional):
-   - If `fileDescriptor != -1`: Call `sendFileStream()` (zero-copy file)
-   - Otherwise: Call `sendBody()` (malloc'd buffer)
-   - On failure: Jump to cleanup, return error code
+**Output:**
+- `*responseBufferLen` set to total bytes in buffer (headers + body)
+- `*responseBuffer` contains complete HTTP response ready to send
 
-3. **Cleanup** (always executed):
-   - Close file descriptor if `fileDescriptor != -1`
-   - Free body buffer if `bodyLen > 0`
-   - Print status code to stdout
+**Key Change (v0.5):**
+Replaces `sendResponse()` - no socket I/O, only buffer preparation. Connection layer handles `send()` call with the populated buffer.
 
-**Return Values:**
-- `Ok`: Complete response sent successfully
-- `HEADER_SEND_ERROR`: Header transmission failed
-- `BODY_SEND_ERROR`: Body transmission failed
-- `FILE_SEND_ERROR`: File transmission failed
+**Usage Example:**
+```c
+char responseBuffer[65536];
+char* bufPtr = responseBuffer;
+size_t responseLen;
+createWritableResponse(&response, &bufPtr, &responseLen);
+// Connection layer now sends responseLen bytes from responseBuffer
+```
 
-**Error Handling:**
-Uses `goto cleanup` pattern to ensure resource cleanup on error.
+## Architecture Changes (v0.5)
 
-**Resource Management:**
-- File descriptor closed even on error (prevents FD leak)
-- Body buffer freed even on error (prevents memory leak)
-- Cleanup guaranteed via goto label
+### Separation of Concerns
 
-**Status Code Logging:**
-Prints `statusCode` to stdout for basic request logging (no timestamps or details).
+**v0.4 Model (Direct Socket I/O):**
+```
+Handler Layer:
+  ├─ Generate response metadata
+  ├─ Send headers to socket (sendHeaders)
+  ├─ Send body to socket (sendBody)
+  └─ Send file to socket (sendFileStream)
+```
 
-**Invariant:**
-Response resources (FD, body buffer) are always freed/closed exactly once.
+**v0.5 Model (Buffer-Based):**
+```
+Handler Layer:
+  ├─ Generate response metadata
+  ├─ Format headers into buffer (generateResponseHeaders)
+  ├─ Append body to buffer (addBody)
+  └─ Return file descriptor for files
 
-## Keep-Alive State Machine (v0.2 Feature, Unchanged in v0.4)
+Connection Layer (connection.c):
+  ├─ Receive buffer from handler
+  ├─ Send buffer to socket (write)
+  └─ Send file using FD (sendfile)
+```
+
+### Benefits of v0.5 Architecture
+
+1. **Event-Driven Ready**
+   - Handlers are synchronous (no blocking I/O)
+   - Connection layer can use epoll/kqueue event loops
+   - Non-blocking sockets possible without handler changes
+
+2. **Clear Responsibility Boundaries**
+   - Handler: Business logic and data generation
+   - Connection: Socket I/O and network operations
+   - No mixing of concerns
+
+3. **Testability**
+   - Handlers can be tested without sockets
+   - Response generation independent of transmission
+   - Mock buffers instead of mock sockets
+
+4. **Flexibility**
+   - Connection layer can optimize I/O strategy
+   - Can switch between blocking/non-blocking without handler changes
+   - Easy to add compression, encryption at connection layer
+
+5. **Performance Opportunities**
+   - Buffer pooling possible (managed by connection layer)
+   - Batch writes possible (combine multiple buffers)
+   - Zero-copy sendfile still available for files
+
+### Handler to Connection Interface
+
+**For API Responses (with body):**
+```c
+// Handler generates response
+response_t response = initializeResponse();
+// ... set status, body, etc.
+
+// Format into buffer
+char buffer[65536];
+char* bufPtr = buffer;
+size_t bufLen;
+createWritableResponse(&response, &bufPtr, &bufLen);
+
+// Connection layer sends
+// write(socket, buffer, bufLen);
+```
+
+**For File Responses:**
+```c
+// Handler opens file
+response_t response = initializeResponse();
+response.fileDescriptor = open(...);
+response.fileSize = stat.st_size;
+
+// Format headers only
+char buffer[65536];
+size_t headerLen = generateResponseHeaders(&response, buffer);
+
+// Connection layer sends headers + file
+// write(socket, buffer, headerLen);
+// sendfile(socket, response.fileDescriptor, NULL, response.fileSize);
+```
+
+### Migration Path
+
+**Removed Functions (v0.4 → v0.5):**
+- `sendResponse()` - Replaced by `createWritableResponse()` + connection layer send
+- `sendHeaders()` - Replaced by `generateResponseHeaders()` (no socket I/O)
+- `sendBody()` - Replaced by `addBody()` (no socket I/O)
+- `sendFileStream()` - Moved to connection layer (handler only provides FD)
+
+**New Functions (v0.5):**
+- `generateResponseHeaders()` - Formats headers into buffer
+- `addBody()` - Appends body to buffer
+- `createWritableResponse()` - Complete buffer preparation
+
+**Unchanged Functions:**
+- `initializeResponse()` - Still creates default response
+- `getFileType()` - Still detects Content-Type
+- `setNotFoundError()`, `setForbiddenFileRoute()`, `setInternalServerError()` - Still set error states
+- `apiHandler()` - Still generates API response bodies
+- `fileHandler()` - Still opens files and prepares metadata
+- `requestHandler()` - Still routes requests
+
+## Keep-Alive State Machine (v0.2 Feature, Unchanged in v0.5)
 
 ### State Propagation Flow
 ```
@@ -621,11 +656,11 @@ httpParser.c:
 handlers.c (requestHandler):
   Check httpInfo.isKeepAlive → set response.shouldClose
 
-handlers.c (sendHeaders):
-  Check response.shouldClose → send "Connection: close/keep-alive"
+handlers.c (generateResponseHeaders):
+  Check response.shouldClose → format "Connection: close/keep-alive" into buffer
 
-server.c:
-  Check response.shouldClose → close connection or continue loop
+connection.c:
+  Check response.shouldClose → close connection or continue event loop
 ```
 
 ### Connection Header Generation
@@ -633,11 +668,11 @@ server.c:
 char* connectionString = response->shouldClose ? "close" : "keep-alive";
 ```
 
-**Invariant**: Every response includes exactly one Connection header.
+**Invariant**: Every response includes exactly one Connection header in the formatted buffer.
 
 ## Critical Invariants
 
-### Response Invariants (Updated v0.4)
+### Response Invariants (v0.5 Updated)
 1. **Status Code Range**: Typically 200-599 (but not validated)
 2. **Status Text**: Must be non-NULL string literal
 3. **Body Allocation**: If `body != NULL`, must be heap-allocated (via `malloc()`)
@@ -646,29 +681,31 @@ char* connectionString = response->shouldClose ? "close" : "keep-alive";
 6. **File XOR Body**: Either `fileDescriptor != -1` OR `body != NULL`, never both
 7. **Content-Type Always Set**: Must point to valid MIME type string literal
 
-### Memory Management Invariants (Updated v0.4)
-1. **Response Body Ownership**: Handler allocates, `sendResponse()` frees
-2. **File Descriptor Ownership**: `fileHandler()` opens, `sendResponse()` closes
-3. **No Double Free**: Body freed exactly once, FD closed exactly once
-4. **Cleanup on Error**: Resources freed/closed even if transmission fails
+### Memory Management Invariants (v0.5 Updated)
+1. **Response Body Ownership**: Handler allocates, `createWritableResponse()` frees
+2. **File Descriptor Ownership**: `fileHandler()` opens, connection layer closes after `sendfile()`
+3. **No Double Free**: Body freed exactly once in `createWritableResponse()`
+4. **Buffer Management**: Response buffer allocated and freed by connection layer
+5. **Synchronous Operation**: Handlers never block on I/O - all socket operations in connection layer
 
-### Routing Invariants (Updated v0.4)
+### Routing Invariants (Updated v0.4, Unchanged v0.5)
 1. **Exact String Match**: Method and path must match exactly (length + content)
 2. **API Prefix Check**: `/api/` prefix stripped before routing
 3. **Default File Serving**: Non-API routes serve from `public/` directory
 4. **GET-Only for Files**: Only GET method allowed for static files (others → 405)
 5. **Method Check First**: Method validated before path routing
 
-### Socket Invariants (Updated v0.4)
-1. **Valid File Descriptor**: Socket FD must be open and writable
-2. **Blocking Sockets**: All send operations block until complete (no timeout currently)
-3. **Partial Write Handling**: All send functions retry until all bytes sent
-4. **Error Recovery**: Send failures clean up resources but return error to caller
+### Buffer Invariants (New in v0.5)
+1. **Buffer Size**: Response buffer is 65536 bytes (RESPONSE_BUFFER_SIZE)
+2. **Header Position**: Headers always start at buffer offset 0
+3. **Body Position**: Body starts immediately after headers (at headerLen offset)
+4. **Total Size Tracking**: `responseBufferLen` = headerLen + bodyLen
+5. **Buffer Reuse**: Connection layer may reuse buffers across requests (handlers don't manage)
 
-### File Serving Invariants (New in v0.4)
+### File Serving Invariants (v0.4, Unchanged v0.5)
 1. **Regular Files Only**: `S_ISREG()` check ensures only regular files served
 2. **openat() Security**: Base directory FD prevents escaping `public/`
-3. **FD Kept Open**: File remains open until after `sendfile()` completes
+3. **FD Kept Open**: File remains open until connection layer completes `sendfile()`
 4. **Content-Length Accurate**: `fstat()` size matches actual file size at open time
 
 ## Known Limitations & Missing Features
@@ -713,16 +750,17 @@ char* connectionString = response->shouldClose ? "close" : "keep-alive";
 - **Hardcoded Headers**: Only Content-Length, Content-Type, and Connection
 
 #### Response Bodies
-- **404/405 Now Have Bodies**: v0.4 adds descriptive error messages
+- **404/405 Now Have Bodies**: v0.4 adds descriptive error messages (unchanged in v0.5)
 - **No HTML Error Pages**: Error bodies are plain text, not user-friendly HTML
 - **No JSON Support**: No structured data response format
 - **Binary Support**: Works but requires client to interpret Content-Type
 
 ### Content Handling
 
-#### Static File Serving (✅ Implemented in v0.4)
+#### Static File Serving (✅ Implemented in v0.4, Architecture Updated v0.5)
 - **Status**: ✅ **Fully Implemented**
-- **Features**: Zero-copy `sendfile()`, Content-Type detection, secure `openat()`
+- **Features**: File descriptor passed to connection layer, Content-Type detection, secure `openat()`
+- **v0.5 Change**: Handler opens file and passes FD to connection layer instead of calling `sendfile()` directly
 - **Limitations**: No directory listing, no range requests, no caching headers
 
 #### Content-Type Detection (✅ Implemented in v0.4)
@@ -746,21 +784,23 @@ char* connectionString = response->shouldClose ? "close" : "keep-alive";
 
 ### Performance & Scalability
 
-#### Buffer Management
-- **Fixed Buffer Size**: 16KB response buffer (not configurable)
-- **No Streaming for Dynamic Content**: API responses buffered entirely in memory
-- **Files Use Zero-Copy**: ✅ v0.4 uses `sendfile()` for static files (no buffering)
+#### Buffer Management (v0.5 Updated)
+- **Fixed Buffer Size**: 65536-byte response buffer (RESPONSE_BUFFER_SIZE, increased from 16KB)
+- **Buffer Allocation**: Managed by connection layer, not handler layer
+- **No Streaming for Dynamic Content**: API responses buffered entirely in memory (unchanged)
+- **Files Use File Descriptors**: v0.5 passes FD to connection layer for zero-copy `sendfile()`
 
-#### Memory Efficiency
+#### Memory Efficiency (v0.5 Updated)
 - **Body Duplication**: Echo handler still copies request body to response body
-- **No Buffer Reuse**: Allocates new header buffer for each response (on stack)
-- **File Serving Efficient**: ✅ v0.4 `sendfile()` requires no user-space buffer
+- **Single Body Allocation**: Body freed immediately after copying to buffer in `createWritableResponse()`
+- **Buffer Reuse**: Connection layer can reuse buffers across multiple requests
+- **File Serving Efficient**: v0.5 uses file descriptor approach, connection layer handles zero-copy `sendfile()`
 
-#### Write Handling (✅ Improved in v0.4)
-- **Partial Write Support**: ✅ All send functions now handle partial writes with retry loops
-- **Blocking Sockets**: Still blocks on slow clients (no application-level timeout)
-- **No Send Timeout**: System-level socket timeout only
-- **Error Handling**: ✅ Cleanup guaranteed via goto cleanup pattern
+#### Write Handling (v0.5 Architecture Change)
+- **No Socket I/O in Handlers**: All send operations moved to connection layer
+- **Synchronous Handlers**: Handlers never block on I/O operations
+- **Partial Write Support**: Handled by connection layer (not handler concern)
+- **Event-Driven Ready**: Handler layer fully synchronous, enabling event loop in connection layer
 
 ### Protocol Compliance
 
@@ -797,28 +837,29 @@ char* connectionString = response->shouldClose ? "close" : "keep-alive";
 
 ### Error Handling
 
-#### Write Errors
-- **No Retry**: Write failure immediately returns
-- **No Logging**: Errors not logged
-- **Inconsistent State**: Failed write may leave partial response
+#### Write Errors (v0.5 Updated)
+- **Handler Layer**: No write errors (handlers don't perform I/O)
+- **Connection Layer**: Handles all write failures and retries
+- **Separation of Concerns**: ✅ Error handling isolated to connection layer
 
 #### malloc Failures
 - **No Handling**: malloc failures cause NULL deref (except in caller)
 - **No 500 Response**: Cannot send error response if malloc fails
 
 #### Invalid Response State
-- **No Validation**: Response not validated before sending
+- **No Validation**: Response not validated before buffer generation
 - **Buffer Overflow**: Not detected (relies on buffer size)
 
 ## Future Enhancements
 
-### Core Features (Status: v0.4 Completed)
-1. ✅ **Static File Serving**: Implemented with zero-copy `sendfile()` (v0.4)
-2. ✅ **Content-Type Detection**: Basic MIME type mapping (v0.4)
-3. **Directory Listing**: Auto-generate HTML index for directories (planned)
-4. **Error Pages**: HTML error responses with styling (planned)
-5. **Range Requests**: Partial content support with 206 status (planned)
-6. **Caching Headers**: ETag, Last-Modified, Cache-Control for static files (planned)
+### Core Features (v0.4 Completed, v0.5 Architectural Foundation)
+1. **Static File Serving**: Implemented with file descriptor approach (v0.4/v0.5)
+2. **Content-Type Detection**: Basic MIME type mapping (v0.4, unchanged v0.5)
+3. **Buffer-Based Interface**: Event-driven architecture foundation (v0.5)
+4. **Directory Listing**: Auto-generate HTML index for directories (planned)
+5. **Error Pages**: HTML error responses with styling (planned)
+6. **Range Requests**: Partial content support with 206 status (planned)
+7. **Caching Headers**: ETag, Last-Modified, Cache-Control for static files (planned)
 
 ### HTTP Methods
 1. **HEAD Support**: Return headers without body (required by HTTP/1.1)
@@ -838,12 +879,15 @@ char* connectionString = response->shouldClose ? "close" : "keep-alive";
 3. **Query Parameters**: Parse and expose query string
 4. **Middleware**: Pre/post-processing hooks
 
-### Performance (v0.5 Roadmap)
-1. **Event-Driven Architecture**: Replace fork() with epoll event loop
-2. **Non-Blocking I/O**: Async socket operations with state machines
-3. **Connection Pooling**: Reuse resources instead of creating per request
-4. **Buffer Pooling**: Reuse response buffers across requests
-5. **Chunked Responses**: Send unknown-length responses incrementally
+### Performance (✅ v0.5 Foundation Complete)
+1. **Separation of Concerns**: Handler layer generates data, connection layer handles I/O (v0.5)
+2. **Synchronous Handlers**: No blocking I/O in handler layer enables event-driven architecture (v0.5)
+3. **Buffer-Based Interface**: Response data prepared in buffers, not sent directly (v0.5)
+4. **Event-Driven I/O**: Connection layer uses epoll/kqueue for non-blocking operations (planned)
+5. **Non-Blocking Sockets**: Async socket operations with state machines in connection layer (planned)
+6. **Connection Pooling**: Reuse resources instead of creating per request (planned)
+7. **Buffer Pooling**: Reuse response buffers across requests (partially ready - connection layer manages buffers)
+8. **Chunked Responses**: Send unknown-length responses incrementally (planned)
 
 ### Protocol Features
 1. **Chunked Responses**: Send unknown-length responses (Transfer-Encoding: chunked)

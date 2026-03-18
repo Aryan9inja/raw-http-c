@@ -4,29 +4,45 @@
 
 `httpParser.c` implements HTTP/1.1 and HTTP/1.0 request parsing with a zero-copy design. It extracts request lines, headers, and body boundaries from raw TCP buffers without allocating memory (except for path processing), returning non-owning views (`bufferView_t`) into the caller's buffer.
 
-### v0.4 Status
-Major enhancements for **URL security** and **routing**:
+### v0.5 Status
+**Event-Driven Architecture** - Parser fully integrated with connection state machine:
+- **No Direct Socket I/O**: Parser works with `connection_t` structures, no socket operations
+- **Buffer-Based Error Handling**: Error responses written to `connection->write_buf`, not sent directly
+- **Embedded Path Buffers**: `decodedPathBuf` and `normalizedPathBuf` now part of `httpInfo_t` (stack arrays)
+- **Embedded Headers Array**: `headers[100]` now part of `httpInfo_t` structure (no heap allocation)
+- **Simplified API**: `requestAndHeaderParser()` no longer takes `headerArray` parameter
+- **Centralized Error Handler**: `handleParseError()` moved from `server.c` to `httpParser.c`
+- Zero-copy design maintained: Parser still doesn't allocate for headers/body views
+- Event-driven model: Parser integrates with epoll-based connection state machine
+
+### v0.4 Background
+URL security and routing features introduced in v0.4:
 - **URL Decoding**: Percent-encoding decoding (`%20` → space, `%2F` → `/`)
 - **Path Normalization**: Resolves `.` and `..` segments, prevents directory traversal
 - **API Detection**: Identifies `/api/` prefix and strips it for routing
 - **HTTP/1.0 Support**: Accepts both HTTP/1.1 and HTTP/1.0 (disables keep-alive for 1.0)
-- **Enhanced httpInfo_t**: New fields for `decodedPath`, `normalizedPath`, `isApi`
-- Zero-copy design maintained: Parser still doesn't allocate for headers/body views
-- Process model unchanged: Each child process runs parser independently
 
 ## Design Philosophy
 
 ### Zero-Copy Parsing
-- Parser **never allocates memory**
+- Parser **never allocates memory** (v0.5: uses embedded buffers in `httpInfo_t`)
 - Returns `bufferView_t` structs pointing into caller's buffer
 - Caller retains buffer ownership and lifetime management
 - No string duplication or copying during parse
+- Path processing uses embedded stack buffers (no heap allocation)
 
 ### Memory Safety Contract
 1. **Parser does not own buffer**: Caller must ensure buffer remains valid
 2. **Parsed views valid until buffer modification**: Any buffer realloc/memmove invalidates all `bufferView_t` pointers
 3. **No null-termination guarantee**: Buffer views may point to middle of buffer (not null-terminated substrings)
 4. **Read-only**: Parser never modifies input buffer
+
+### Event-Driven Integration (v0.5)
+- **Connection State Machine**: Parser works with `connection_t` structures
+- **No Direct Socket I/O**: All I/O handled by epoll-based event loop
+- **Buffer-Based Responses**: Error responses written to `write_buf`, not sent directly
+- **Stateless Design**: Parser has no persistent state between calls
+- **Async-Friendly**: Parse operations synchronous but integrate with async I/O model
 
 ## Core Data Structures
 
@@ -60,40 +76,47 @@ typedef struct {
 - Key is case-sensitive in storage (case-insensitive for special headers)
 
 ### `httpInfo_t`
-Complete parsed HTTP request with URL security processing (v0.4 enhanced):
+Complete parsed HTTP request (v0.5 event-driven architecture):
 ```c
 typedef struct {
     bufferView_t method;
-    bufferView_t path;              // Raw path from request line
+    bufferView_t path;                      // Raw path from request line
     bufferView_t version;
-    header_t* headers;               // Array of headers
-    int headerCnt;                   // Number of parsed headers
-    unsigned long contentLength;     // 0 if no Content-Length header
-    bufferView_t contentType;        // Empty if no Content-Type header
-    bufferView_t body;               // Empty if no body
-    int isKeepAlive;                 // 1 = keep-alive, 0 = close
-    int isContentLengthSeen;         // Internal flag for duplicate detection
-    bufferView_t decodedPath;        // URL-decoded path (v0.4, heap-allocated)
-    bufferView_t normalizedPath;     // Normalized safe path (v0.4, heap-allocated)
-    int isApi;                       // 1 if /api/ prefix, 0 otherwise (v0.4)
+    size_t headerCnt;                       // Number of parsed headers
+    header_t headers[100];                  // Embedded headers array (v0.5)
+    size_t contentLength;                   // 0 if no Content-Length header
+    bufferView_t contentType;               // Empty if no Content-Type header
+    int isContentLengthSeen;                // Internal flag for duplicate detection
+    bufferView_t body;                      // Empty if no body
+    int isKeepAlive;                        // 1 = keep-alive, 0 = close
+    int isApi;                              // 1 if /api/ prefix, 0 otherwise
+    bufferView_t decodedPath;               // URL-decoded path (points to decodedPathBuf)
+    bufferView_t normalizedPath;            // Normalized safe path (points to normalizedPathBuf)
+    char decodedPathBuf[PATH_BUFFER_CAP];   // Embedded buffer for decoded path (v0.5)
+    char normalizedPathBuf[PATH_BUFFER_CAP]; // Embedded buffer for normalized path (v0.5)
+    size_t decodedPathCap;                  // Capacity of decodedPathBuf
+    size_t normalizedPathCap;               // Capacity of normalizedPathBuf
 } httpInfo_t;
 ```
 
-**New Fields (v0.4):**
+**Key Fields:**
+- `headers[100]`: Embedded stack array (v0.5), no heap allocation needed
 - `decodedPath`: Percent-decoded path (e.g., `/hello%20world` → `/hello world`)
-  - Memory: malloc'd buffer, freed by caller
+  - Points to `decodedPathBuf` (embedded stack array, v0.5)
   - Length: Same or shorter than original path
 - `normalizedPath`: Safe path after resolving `.` and `..` segments
-  - Memory: malloc'd buffer, freed by caller
+  - Points to `normalizedPathBuf` (embedded stack array, v0.5)
   - Always starts with `/`, never escapes document root
 - `isApi`: Flag indicating `/api/` prefix was found and stripped
   - 1: API route (path rewritten: `/api/foo` → `/foo`)
   - 0: Static file route
 
-**Memory Ownership (v0.4 Changes):**
-- **Parser allocates**: `decodedPath.data` and `normalizedPath.data` (heap)
-- **Caller must free**: Both buffers after request processing
-- **All other views**: Still zero-copy (point into caller's buffer)
+**Memory Ownership (v0.5 Changes):**
+- **No heap allocation**: All buffers embedded in structure (stack arrays)
+- **Headers array**: Embedded `headers[100]` array, max 100 headers per request
+- **Path buffers**: Embedded `decodedPathBuf` and `normalizedPathBuf` arrays (8KB each)
+- **Buffer views**: `decodedPath` and `normalizedPath` point to embedded buffers
+- **All other views**: Still zero-copy (point into caller's read buffer)
 
 ## Key Functions
 
@@ -110,36 +133,51 @@ httpInfo_t* initializeHttpInfo(httpInfo_t* httpInfo);
 - `isContentLengthSeen = 0`
 - `isKeepAlive = 1` (HTTP/1.1 default)
 - `headerCnt = 0`
-- `isApi = 0` (v0.4)
-- `decodedPath.len = 0` (v0.4)
+- `isApi = 0`
+- `decodedPath.data = decodedPathBuf` (v0.5: points to embedded buffer)
+- `decodedPath.len = 0`
+- `decodedPathCap = PATH_BUFFER_CAP` (v0.5)
+- `normalizedPath.data = normalizedPathBuf` (v0.5: points to embedded buffer)
+- `normalizedPath.len = 0`
+- `normalizedPathCap = PATH_BUFFER_CAP` (v0.5)
 - Other views: Not initialized (set during parsing)
 
 **Returns:** Pointer to initialized `httpInfo` (for chaining)
+
+**v0.5 Changes:**
+- Initializes `decodedPath.data` and `normalizedPath.data` to point to embedded buffers
+- Sets capacity fields for embedded path buffers
+- No heap allocation needed
 
 **Invariant**: Must be called before every `requestAndHeaderParser()` call to ensure clean state.
 
 ### `requestAndHeaderParser()`
 Parses HTTP request line and all headers from buffer.
 
-**Signature:**
+**Signature (v0.5):**
 ```c
-parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, header_t* headerArray, httpInfo_t* uninitializedHttpInfo);
+parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, httpInfo_t* uninitializedHttpInfo);
 ```
+
+**Parameters:**
+- `buffer`: Pointer to start of HTTP request in read buffer
+- `headerEnd`: Pointer to end of headers (`\r\n\r\n` position)
+- `uninitializedHttpInfo`: Pointer to `httpInfo_t` structure (must be initialized first)
+
+**v0.5 Changes:**
+- **Removed `headerArray` parameter**: Headers now stored in embedded `httpInfo->headers[100]` array
+- Simpler function signature for event-driven architecture
 
 **Parsing Steps:**
 1. **Request Line**: Extract method, path, version (space-delimited)
-2. **Version Validation**: Ensure "HTTP/1.1" or "HTTP/1.0" (v0.4 updated)
+2. **Version Validation**: Ensure "HTTP/1.1" or "HTTP/1.0"
 3. **HTTP/1.0 Handling**: Set `isKeepAlive = 0` for HTTP/1.0 requests
-4. **Header Loop**: Parse headers until `\r\n\r\n` (empty line)
+4. **Header Loop**: Parse headers into embedded `headers[]` array until `\r\n\r\n`
 5. **Special Headers**: Extract Content-Length, Content-Type, Connection
 6. **Body Validation**: Verify GET requests have no body
-7. **API Detection**: Call `checkIfApi()` to identify `/api/` routes (v0.4)
+7. **API Detection**: Call `checkIfApi()` to identify `/api/` routes
 
 **Returns**: `parserResult_t` (OK on success, error code on failure)
-
-**Key Changes in v0.4:**
-- Accepts HTTP/1.0 (previously only HTTP/1.1)
-- Calls `checkIfApi()` to set `isApi` flag and rewrite path
 
 ### `checkIfApi()`
 Detects `/api/` prefix and rewrites path for API routing (new in v0.4).
@@ -351,6 +389,47 @@ Creates a buffer view for the request body based on `Content-Length`.
 
 **Invariant**: Only call after successful `requestAndHeaderParser()` and when `contentLength > 0`.
 
+### `handleParseError()`
+Formats HTTP error response into connection's write buffer (v0.5).
+
+**Signature:**
+```c
+void handleParseError(parserResult_t res, connection_t* conn);
+```
+
+**Parameters:**
+- `res`: Parser error result code (e.g., `BAD_REQUEST_LINE`, `INVALID_VERSION`)
+- `conn`: Pointer to connection structure containing write buffer
+
+**Behavior:**
+- Maps `parserResult_t` error code to HTTP status code and message
+- Formats complete HTTP error response (status line + headers + body)
+- Writes response directly into `conn->write_buf`
+- Updates `conn->write_len` with response size
+- Does **NOT** send to socket (caller handles I/O via state machine)
+
+**v0.5 Event-Driven Architecture:**
+- Moved from `server.c` to `httpParser.c` for better encapsulation
+- Changed from `int socket` to `connection_t* conn` parameter
+- No direct socket I/O - response buffered for async sending
+- Integrates with epoll-based connection state machine
+
+**Error Response Format:**
+```
+HTTP/1.1 <status_code> <status_text>\r\n
+Content-Type: text/plain\r\n
+Content-Length: <body_length>\r\n
+Connection: close\r\n
+\r\n
+<status_text>
+```
+
+**Example Error Mappings:**
+- `BAD_REQUEST_LINE` → 400 Bad Request
+- `INVALID_VERSION` → 505 HTTP Version Not Supported
+- `PAYLOAD_TOO_LARGE` → 413 Payload Too Large
+- `REQUEST_TIMEOUT` → 408 Request Timeout
+
 ### Utility Functions
 
 #### `strstr_len()`
@@ -498,10 +577,16 @@ Layer 3: openat(docroot_fd, "../etc/passwd") → ENOENT (stays in docroot)
 2. **Path Rewrite Consistent**: Strip exactly 4 characters (`/api`)
 3. **Non-API Default**: Missing `/api/` prefix → static file serving
 
-### Memory Safety (v0.4 Changes)
-1. **Caller Frees Paths**: `decodedPath` and `normalizedPath` buffers must be freed
-2. **Allocation Failure**: Returns error if malloc fails (decodedPath/normalizedPath buffers)
-3. **No Buffer Overrun**: Length checks prevent writing past buffer end
+### Memory Safety
+**v0.5 Changes:**
+1. **No Dynamic Allocation**: Path buffers embedded in `httpInfo_t` (stack arrays)
+2. **Buffer Size**: `decodedPathBuf` and `normalizedPathBuf` are 8KB each (`PATH_BUFFER_CAP`)
+3. **No Freeing Required**: All memory managed as part of structure lifetime
+4. **No Buffer Overrun**: Length checks prevent writing past buffer end
+
+**v0.4 Background:**
+- Previously: `decodedPath` and `normalizedPath` were heap-allocated
+- Previously: Caller had to free path buffers after use
 
 ## Keep-Alive Semantics (v0.2 Feature, HTTP/1.0 Update in v0.4)
 
@@ -600,9 +685,10 @@ Content-Type:   text/plain   \r\n
 
 ### State Invariants
 1. **Clean Initialization**: `initializeHttpInfo()` must be called before each parse
-2. **Header Array Ownership**: Caller provides and owns header array
+2. **Embedded Arrays**: Headers and path buffers are part of `httpInfo_t` structure (v0.5)
 3. **No Partial Parse State**: Parser is stateless (no context between calls)
 4. **Atomic Failure**: Parse errors leave `httpInfo_t` in unspecified state (must reinitialize)
+5. **Connection Integration**: Parser works with `connection_t` structures in event-driven model (v0.5)
 
 ## Known Limitations & Missing Features
 
@@ -631,8 +717,8 @@ Content-Type:   text/plain   \r\n
 
 #### Header Count Limit
 - **Status**: `TOO_MANY_HEADERS` error defined but never returned
-- **Impact**: Can overflow header array (hardcoded to 100 in server.c)
-- **Risk**: Buffer overflow vulnerability
+- **Impact**: Can overflow header array (embedded `headers[100]` in `httpInfo_t`, v0.5)
+- **Risk**: Buffer overflow vulnerability if more than 100 headers parsed
 
 #### Header Size Limit
 - **Status**: `HEADER_TOO_LARGE` error defined but never returned
@@ -653,9 +739,9 @@ Content-Type:   text/plain   \r\n
 - **Workaround**: Body returned as opaque blob
 
 #### URL Decoding
-- **Status**: Not implemented
-- **Impact**: Percent-encoded characters (e.g., `%20`) not decoded
-- **Workaround**: Handler must decode manually
+- **Status**: Implemented in v0.4 via `decodeUrl()`
+- **Feature**: Percent-encoded characters decoded (e.g., `%20` → space)
+- **Integration**: Automatic during request parsing
 
 #### Query String Parsing
 - **Status**: Path includes query as-is

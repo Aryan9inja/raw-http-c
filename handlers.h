@@ -64,12 +64,6 @@ typedef enum{
  */
 response_t requestHandler(httpInfo_t* httpInfo, int root_fd);
 
-/**
- * Sends an HTTP response through a socket
- * @param socket File descriptor of the client socket
- * @param response Pointer to the response structure to send
- * @return requestResponse_t status of the send operation
- */
-requestResponse_t sendResponse(int socket, response_t* response);
+void createWritableResponse(response_t* response, char** responseBuffer, size_t* responseBufferLen);
 
 #endif
