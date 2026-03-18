@@ -97,11 +97,11 @@ void handleHeaders(connection_t* conn) {
     fprintf(stdout, "Header parsing successfull\n");
     conn->state = READING_BODY;
     // Update parse offset
-    conn->parse_offset += header_size + 3;
+    conn->parse_offset += header_size + 4;
 }
 
 void handleBody(connection_t* conn) {
-    char* bodyStart = conn->read_buf + conn->parse_offset + 1;
+    char* bodyStart = conn->read_buf + conn->parse_offset;
     parserResult_t bodyParserRes = bodyParser(bodyStart, &conn->request);
     if (bodyParserRes == OK) {
         fprintf(stdout, "Body parsed\n");
@@ -142,9 +142,10 @@ void handleRequestProcessing(connection_t* conn) {
 
     createWritableResponse(&generatedResponse, &conn->write_buf, &conn->write_len);
     fprintf(stdout, "Changing state to write\n");
-    if(!conn->request.isApi){
-        conn->file_fd=generatedResponse.fileDescriptor;
-        conn->file_remaining=generatedResponse.fileSize;
+    if (!conn->request.isApi) {
+        conn->file_fd = generatedResponse.fileDescriptor;
+        conn->file_remaining = generatedResponse.fileSize;
+        conn->file_offset = 0;
     }
     conn->state = WRITING_RESPONSE;
 }
@@ -207,34 +208,39 @@ void handleRead(connection_t* conn) {
 
 void handleSend(connection_t* conn) {
     while (conn->write_sent < conn->write_len) {
-        ssize_t sent = send(conn->fd, conn->write_buf, conn->write_len, 0);
+        ssize_t sent = send(conn->fd, conn->write_buf + conn->write_sent, conn->write_len - conn->write_sent, 0);
         if (sent < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                conn->state = CLOSING;
                 return;
             }
+            conn->state = CLOSING;
+            return;
         }
         conn->write_sent += sent;
     }
     if (!conn->request.isApi) {
         conn->state = SENDING_FILE;
-        fprintf(stdout,"Changing state to file\n");
+        fprintf(stdout, "Changing state to file\n");
         return;
     }
     conn->state = READING_HEADERS;
 }
 
 void handleFileSend(connection_t* conn) {
-    fprintf(stdout,"Entered handleFileSend\n");
-    off_t offset = 0;
+    fprintf(stdout, "Entered handleFileSend\n");
+    off_t offset = conn->file_offset;
     size_t remainingFileSize = conn->file_remaining;
-    fprintf(stdout,"Remaining = %zu\n",remainingFileSize);
+    fprintf(stdout, "Remaining = %zu\n", remainingFileSize);
     while (remainingFileSize > 0) {
         size_t byteCount = remainingFileSize;
         ssize_t sent = sendfile(conn->fd, conn->file_fd, &offset, byteCount);
 
         if (sent <= 0) {
-            if (errno == EAGAIN || errno == EINTR) return;
+            if (errno == EAGAIN || errno == EINTR) {
+                conn->file_offset = offset;
+                conn->file_remaining = remainingFileSize;
+                return;
+            }
             conn->state = CLOSING;
             return;
         }
