@@ -218,6 +218,10 @@ void handleSend(connection_t* conn) {
         }
         conn->write_sent += sent;
     }
+    // Reset for next request
+    conn->write_sent=0;
+    conn->write_len=0;
+
     if (!conn->request.isApi) {
         conn->state = SENDING_FILE;
         fprintf(stdout, "Changing state to file\n");
