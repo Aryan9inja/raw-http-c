@@ -2,492 +2,491 @@
 
 ## Overview
 
-`server.c` is the main entry point and orchestrator of the HTTP/1.1 server. It manages TCP socket operations, connection lifecycle, buffer management, document root file descriptor, and coordinates the request-response pipeline through the parser and handler components.
+`server.c` is the main entry point and orchestrator of the HTTP/1.1 server. In v0.5, it implements an event-driven architecture using Linux epoll for I/O multiplexing, managing multiple concurrent connections in a single process with non-blocking sockets.
 
-### v0.4 Status
-Enhancements for **static file serving security** and **timeout protection**:
-- **Document Root FD**: Opens `public/` directory at startup, passed to all child processes
-- **Socket Timeout**: 10-second read timeout via `setsockopt(SO_RCVTIMEO)` 
-- **URL Processing**: Decodes and normalizes paths before routing to handlers
-- **Memory Management**: Allocates/frees `decodedPath` and `normalizedPath` buffers per request
-- Process model unchanged: Each child calls `handleClient()` independently
+### v0.5 Status
+Complete rewrite for **event-driven architecture**:
+- **Event Loop**: Single-process epoll-based I/O multiplexing
+- **Non-Blocking Sockets**: Server and client sockets configured with O_NONBLOCK
+- **State Machine**: Per-connection state tracking via `connection_t` structures
+- **Scalable**: Handles 10,000+ concurrent connections (C10K capable)
+- **Memory Efficient**: No process/thread creation overhead per connection
+- **Document Root FD**: Passed to all connections for secure file access
 
 ## Key Responsibilities
 
 1. **TCP Socket Setup**: Creates, binds, and listens on port 8080
-2. **Document Root Setup** (v0.4): Opens `public/` directory descriptor for secure file access
-3. **Socket Timeout Configuration** (v0.4): Sets 10-second read timeout per connection
-4. **Connection Acceptance**: Accepts incoming client connections (parent process)
-5. **Process Spawning** (v0.3): Forks child process per connection
-6. **Buffer Management**: Dynamically allocates and manages per-connection buffers
-7. **URL Processing** (v0.4): Decodes and normalizes paths for security
-8. **Request Processing Loop**: Implements keep-alive connection handling with request pipelining
-9. **Error Handling**: Maps parser errors to HTTP status codes and generates error responses
-10. **Resource Cleanup**: Ensures proper cleanup of memory, file descriptors, and sockets
+2. **Document Root Setup**: Opens `public/` directory descriptor for secure file access
+3. **Epoll Configuration**: Creates epoll instance and registers server socket
+4. **Event Loop**: Infinite loop waiting for socket events via epoll_wait()
+5. **Connection Acceptance**: Non-blocking accept() loop for new connections
+6. **Connection Management**: Allocates and initializes `connection_t` structures
+7. **Event Dispatching**: Routes events to connectionHandler() for processing
+8. **Interest Updates**: Modifies epoll interest based on handler return values
+9. **Resource Cleanup**: Closes connections and frees memory when state is CLOSING
 
-## Core Functions
+## Core Architecture
 
-### `handleParseError()`
-Maps parser error codes (`parserResult_t`) to appropriate HTTP status codes and sends error responses to the client.
+### Event Loop Flow
 
-**Error Mapping Table (v0.4 Updated):**
-- `BAD_REQUEST_LINE`, `BAD_HEADER_SYNTAX`, `INVALID_CONTENT_LENGTH` → 400 Bad Request
-- `BAD_REQUEST_PATH` (v0.4): Invalid URL encoding or path traversal → 400 Bad Request
-- `UNSUPPORTED_METHOD` → 405 Method Not Allowed
-- `HEADER_TOO_LARGE`, `TOO_MANY_HEADERS` → 431 Request Header Fields Too Large
-- `PAYLOAD_TOO_LARGE` → 413 Payload Too Large
-- `REQUEST_TIMEOUT` (v0.4): Socket read timeout → 408 Request Timeout
-- `UNSUPPORTED_TRANSFER_ENCODING` → 501 Not Implemented
-- `INVALID_VERSION` → 505 HTTP Version Not Supported
-
-**Response Format:**
 ```
-HTTP/1.1 <status> <message>\r\n
-Content-Length: 0\r\n
-Connection: close\r\n\r\n
-```
-All error responses close the connection (no keep-alive).
-
-### `handleClient()` (v0.4 Updated)
-Main request processing function for each client connection (runs in child process).
-
-**Signature:**
-```c
-void handleClient(int new_socket, int docroot_fd);
-```
-
-**Parameters:**
-- `new_socket`: Client socket descriptor (inherited from parent via fork)
-- `docroot_fd`: File descriptor for `public/` directory (inherited from parent, v0.4)
-
-**Processing Steps:**
-1. **Timeout Configuration**: Set 10-second socket read timeout
-2. **Buffer Allocation**: Allocate initial 4KB buffer and header array
-3. **Request Loop**: Read → Parse → Decode URL → Normalize → Handle → Respond
-4. **Keep-Alive**: Continue loop or break based on `response.shouldClose`
-5. **Cleanup**: Free all buffers, close socket, exit child process
-
-**New in v0.4: URL Processing Per Request**
-```c
-// After successful header parsing:
-
-// 1. Allocate and decode URL
-decodedPath = malloc(httpInfo.path.len);
-httpInfo.decodedPath.data = decodedPath;
-parseResult = decodeUrl(&httpInfo.path, &httpInfo.decodedPath);
-
-// 2. Allocate and normalize path
-normalizedPath = malloc(httpInfo.decodedPath.len);
-httpInfo.normalizedPath.data = normalizedPath;
-parseResult = normalizePath(&httpInfo.decodedPath, &httpInfo.normalizedPath);
-
-// 3. Route using normalized path
-response_t response = requestHandler(&httpInfo, docroot_fd);
-
-// 4. Free path buffers before next iteration
-free(decodedPath);
-free(normalizedPath);
-```
-
-**Memory Management:**
-- `decodedPath` and `normalizedPath` allocated/freed per request
-- Prevents memory leaks in keep-alive connections with multiple requests
-- Cleanup section frees buffers even on error (goto cleanup pattern)
-
-### `main()` (v0.4 Updated)
-The main server initialization and connection acceptance loop.
-
-**New in v0.4:**
-```c
-// 1. Open document root directory (before fork loop)
-docroot_fd = open("public", O_RDONLY | O_DIRECTORY);
-
-// 2. Set socket read timeout structure
-struct timeval timeout;
-timeout.tv_sec = 10;
-timeout.tv_usec = 0;
-
-// 3. Apply timeout in handleClient (per connection)
-setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-```
-
-**Initialization Sequence:**
-1. Open `public/` directory → `docroot_fd`
-2. Create TCP socket
-3. Set socket options (`SO_REUSEADDR`, `SO_REUSEPORT`)
-4. Bind to port 8080
-5. Listen for connections (backlog=10)
-6. Setup `SIGCHLD` handler for zombie reaping
-
-**Connection Loop:**
-```
-while (1) {
-    new_socket = accept(server_fd, ...);  // Block until connection
-    
-    pid_t pid = fork();
-    if (pid == 0) {  // Child process
-        close(server_fd);              // Close server socket in child
-        handleClient(new_socket, docroot_fd);  // Pass docroot_fd
-        // handleClient never returns (exits or error)
-    }
-    else {  // Parent process
-        close(new_socket);             // Close client socket in parent
-        // Loop back to accept next connection
-    }
-}
-```
-
-**File Descriptor Inheritance:**
-- `docroot_fd` opened once by parent
-- Inherited by all child processes via `fork()` (copy-on-write)
-- Each child can use it independently (read-only, thread-safe)
-- Never closed (lives for server lifetime)
-
-## Buffer Management Model
-
-### Initial Allocation
-- **Initial Size**: 4096 bytes (`BUFFER_SIZE`)
-- **Maximum Size**: 16384 bytes (`MAX_REQUEST_LIMIT`)
-- **Null Termination**: Buffer always null-terminated after reads for string safety
-
-### Dynamic Reallocation Strategy
-When a request exceeds the current buffer size:
-1. Check if doubling the buffer would exceed `MAX_REQUEST_LIMIT`
-2. If within limit, reallocate buffer to double size
-3. If exceeding limit, return 413 Payload Too Large error
-4. If reallocation fails, return 500 Internal Server Error
-
-### Buffer Offsets
-- **`readOffset`**: Total bytes read from socket into buffer (cumulative)
-- **`parseOffset`**: Bytes successfully consumed by parser (cumulative)
-- **Invariant**: `parseOffset ≤ readOffset` at all times
-
-### Buffer Shifting
-After successfully parsing a request:
-```
-unparsedBytes = readOffset - parseOffset
-```
-If `unparsedBytes > 0` (pipelined requests present):
-- Use `memmove()` to shift unparsed bytes to buffer start
-- Reset `readOffset = unparsedBytes`
-- Reset `parseOffset = 0`
-- Continue to parse next request
-
-## Keep-Alive Connection Logic (v0.2 Feature, URL Processing Added v0.4)
-
-### Connection Lifecycle (Updated v0.4)
-1. Accept connection (parent process)
-2. Fork child process
-3. **Child Process Lifecycle:**
-   - Configure socket timeout (10 seconds)
-   - Allocate buffer and header array
-   - **Inner Loop**: Read → Parse → Decode URL → Normalize → Handle → Respond
-   - After each response, check `response.shouldClose`:
-     - If `shouldClose == 1`: Break to cleanup (close connection)
-     - If `shouldClose == 0`: Free path buffers, continue loop (keep-alive)
-   - Cleanup and close connection, exit process
-
-### Request Timeout Protection (New in v0.4)
-
-**Timeout Configuration:**
-```c
-struct timeval timeout;
-timeout.tv_sec = 10;    // 10 seconds
-timeout.tv_usec = 0;
-
-setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-```
-
-**Behavior:**
-- Applied to `read()` calls on client socket
-- If client doesn't send data within 10 seconds, `read()` returns -1 with `errno = EAGAIN` or `EWOULDBLOCK`
-- Server sends 408 Request Timeout error response
-- Connection closed (no keep-alive for timed-out requests)
-
-**Benefits:**
-- Prevents slow client attacks (slowloris)
-- Releases resources from stalled connections
-- Each connection has independent timeout (per child process)
-
-**Limitations:**
-- Timeout applies per `read()` call, not request total time
-- Long requests with continuous data flow won't timeout
-- Send operations have no application-level timeout (rely on TCP)
-
-### Request Pipelining Support (Unchanged from v0.2)
-The server can process multiple pipelined requests from a single connection:
-- Client may send multiple requests without waiting for responses
-- Buffer preserves unparsed bytes after each request
-- Inner parse loop processes all complete requests in buffer
-- Continues reading only after processing buffered requests
-
-### Keep-Alive Flow
-```
-┌─────────────────────────────────────┐
-│      Accept Connection              │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│   Allocate Buffer & Headers         │
-└──────────────┬──────────────────────┘
-               │
-               │  ╔═══════════════════════════════╗
-               └─>║   Keep-Alive Request Loop     ║
-                  ╚═══════════════════════════════╝
-                               │
-                               ▼
-                  ┌────────────────────────┐
-                  │    Read Request Data   │
-                  │  (from socket buffer)  │
-                  └───────────┬────────────┘
-                              │
-                              ▼
-                  ┌────────────────────────┐
-                  │    Parse Request       │
-                  │  (headers & body)      │
-                  └───────────┬────────────┘
-                              │
-                              ▼
-                  ┌────────────────────────┐
-                  │   Handle Request       │
-                  │  (route & generate)    │
-                  └───────────┬────────────┘
-                              │
-                              ▼
-                  ┌────────────────────────┐
-                  │   Send Response        │
-                  │  (headers & body)      │
-                  └───────────┬────────────┘
-                              │
-                              ▼
-                  ┌────────────────────────┐
-                  │  shouldClose == 1?     │
-                  │ (check Connection hdr) │
-                  └───┬──────────────┬─────┘
-                      │              │
-                     NO             YES
-                      │              │
-                      │              ▼
-                      │   ┌─────────────────────┐
-                      │   │  Cleanup & Close    │
-                      │   │ - Free buffer       │
-                      │   │ - Free headers      │
-                      │   │ - Close socket      │
-          Keep-Alive  |   │ - Exit connection   │
-          (loop back) |   └─────────────────────┘
+┌─────────────────────────────────────────────┐
+│           epoll_wait()                      │
+│     (blocks until events ready)             │
+└─────────────┬───────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────┐
+    │  Events Available?  │
+    └─────────┬───────────┘
+              │
+        ┌─────┴─────┐
+        │           │
+        ▼           ▼
+ [Server Socket]  [Client Socket(s)]
+        │              │
+        │              ▼
+        │    ┌──────────────────────┐
+        │    │ connectionHandler()  │
+        │    │  (state machine)     │
+        │    └──────────┬───────────┘
+        │               │
+        │         Returns event mask
+        │               │
+        ▼               ▼
+ accept() loop   ┌─────────────────┐
+   (EAGAIN)      │ EPOLL_CTL_MOD   │
+        │        │  or             │
+        │        │ EPOLL_CTL_DEL   │
+        │        │  (close)        │
+        │        └─────────────────┘
+        │
+        ▼
+ Create connection_t
+ Set non-blocking
+ initializeConnection()
+ EPOLL_CTL_ADD
+        │
+        └─────────────┐
                       │
-                      └──────┐
-                             │
-                             └──> (back to Read Request Data)
+                      ▼
+              Back to epoll_wait()
 ```
 
-### Request Pipelining Support
-The server can process multiple pipelined requests from a single connection:
-- Client may send multiple requests without waiting for responses
-- Buffer preserves unparsed bytes after each request
-- Inner parse loop processes all complete requests in buffer
-- Continues reading only after processing buffered requests
+### Main Function Structure
 
-## Process-Based Concurrency (v0.3)
-
-### Multi-Process Architecture
-The server uses `fork()` to handle multiple concurrent client connections simultaneously:
-
-**Parent Process Responsibilities:**
-1. Create and bind server socket on port 8080
-2. Call `listen()` to mark socket as accepting connections
-3. **Infinite accept loop**: Call `accept()` to wait for incoming connections
-4. When connection arrives, call `fork()` to create child process
-5. Parent closes the client socket descriptor (child uses it)
-6. Parent returns to step 3 to accept next connection
-7. Install `SIGCHLD` signal handler to reap zombies at startup
-
-**Child Process Responsibilities:**
-1. Inherit open client socket from parent via `fork()`
-2. Close server socket descriptor immediately (only parent listens)
-3. Run `handleClient()` to process HTTP requests on that socket
-4. Handle keep-alive connections as separate entity from other clients
-5. Exit (via `exit(EXIT_SUCCESS)` in `handleClient()`) when client closes connection
-
-### Zombie Process Reaping
-
-**Problem:** When a child process exits, it becomes a "zombie" — its process table entry remains until parent calls `wait()` or `waitpid()`
-
-**Solution: SIGCHLD Handler**
 ```c
-void burnZombies(int s) {
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0);  // Reap all available zombies
-    errno = saved_errno;
+int main() {
+    // 1. Setup
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(server_fd, F_SETFL, O_NONBLOCK);  // Non-blocking
+    
+    int docroot_fd = open("public", O_RDONLY | O_DIRECTORY);
+    
+    // 2. Bind and listen
+    bind(server_fd, ...);
+    listen(server_fd, 50);  // Backlog of 50
+    
+    // 3. Create epoll instance
+    int epoll_fd = epoll_create(1);
+    
+    // 4. Register server socket for EPOLLIN
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    
+    // 5. Event loop
+    struct epoll_event events[100];
+    while (1) {
+        int n = epoll_wait(epoll_fd, events, 100, -1);
+        
+        for (int i = 0; i < n; i++) {
+            if (events[i].data.fd == server_fd) {
+                // Accept new connections
+                handle_accepts(server_fd, epoll_fd, docroot_fd);
+            } else {
+                // Handle client I/O
+                handle_client_event(events[i], epoll_fd);
+            }
+        }
+    }
 }
 ```
 
-**Signal Handler Setup:**
+## Key Components
+
+### 1. Socket Initialization
+
+**Non-Blocking Server Socket:**
 ```c
-struct sigaction sa;
-sa.sa_handler = burnZombies;
-sigemptyset(&sa.sa_mask);
-sa.sa_flags = SA_RESTART;  // Restart interrupted system calls
-sigaction(SIGCHLD, &sa, NULL);
+int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+int flags = fcntl(server_fd, F_GETFL, 0);
+fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 ```
 
-**How It Works:**
-1. Kernel sends `SIGCHLD` signal when child process exits
-2. Parent's signal handler runs asynchronously
-3. `waitpid(-1, NULL, WNOHANG)` reaps one zombie child
-4. Loop continues to reap all available zombies (non-blocking mode)
-5. `errno` saved/restored for signal safety (avoid breaking concurrent system calls)
+- Server socket set to non-blocking mode
+- accept() returns EAGAIN when no connections pending
+- Allows draining accept queue in a loop
+
+**Socket Options:**
+```c
+int opt = 1;
+setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+```
+
+- SO_REUSEADDR: Allow immediate port reuse after restart
+- Prevents "Address already in use" errors
+
+### 2. Epoll Setup
+
+**Creating Epoll Instance:**
+```c
+int epoll_fd = epoll_create(1);  // Size hint (ignored in modern kernels)
+```
+
+**Registering Server Socket:**
+```c
+struct epoll_event ev;
+ev.events = EPOLLIN;           // Monitor for incoming connections
+ev.data.fd = server_fd;        // Store server socket fd
+epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+```
+
+- EPOLLIN: Ready for reading (new connections available)
+- data.fd: Used to identify server socket in event loop
+
+### 3. Accept Loop
+
+**Non-Blocking Accept:**
+```c
+while ((new_socket = accept(server_fd, &address, &addrlen)) != -1) {
+    // Set client socket non-blocking
+    int flags = fcntl(new_socket, F_GETFL, 0);
+    fcntl(new_socket, F_SETFL, flags | O_NONBLOCK);
+    
+    // Allocate connection structure
+    connection_t* conn = malloc(sizeof(connection_t));
+    initializeConnection(conn, new_socket, docroot_fd);
+    
+    // Register with epoll
+    struct epoll_event conn_ev;
+    conn_ev.events = EPOLLIN;
+    conn_ev.data.ptr = conn;  // Store connection pointer
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &conn_ev);
+}
+
+// Check for EAGAIN (no more connections)
+if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    perror("accept");
+}
+```
 
 **Key Points:**
-- Non-blocking wait (`WNOHANG`): Handler doesn't block parent's main loop
-- Loop until no more zombies available (handles burst of child exits)
-- `SA_RESTART` flag: Interrupted system calls (like `accept()`) automatically restart
-- Signal-safe code: Only `waitpid()` called in handler (other calls could corrupt state)
+- Loop drains all pending connections from accept queue
+- Each client socket configured as non-blocking
+- Connection structure allocated and initialized
+- Connection pointer stored in epoll_event.data.ptr
+- Initial interest is EPOLLIN (ready to read request)
 
-### Process Lifecycle Example
+### 4. Event Dispatching
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Parent Process                            │
-│                                                               │
-│  1. socket() → 2. bind() → 3. listen()                       │
-│                       ↓                                       │
-│  4. Setup SIGCHLD handler (reaps zombies)                   │
-│                       ↓                                       │
-│  ┌───────────────────────────────────┐                       │
-│  │ 5. Infinite Loop:                 │                       │
-│  │    accept() → wait for connection │                       │
-│  │       ↓ (connection arrives)       │                       │
-│  │    fork()                          │                       │
-│  │       ├─── Child (PID != 0)        │                       │
-│  │       │    → close(server_fd)      │                       │
-│  │       │    → handleClient(sock)    │                       │
-│  │       │    → exit()                │                       │
-│  │       │                            │                       │
-│  │       └─── Parent (PID == 0)       │                       │
-│  │            → close(client_sock)    │                       │
-│  │            → back to accept()      │                       │
-│  │                                    │                       │
-│  └───────────────────────────────────┘                       │
-│                                                               │
-│  Note: SIGCHLD handler runs asynchronously                  │
-│        when children exit, reaping zombies                  │
-└──────────────────────────────────────────────────────────────┘
+**Processing Client Events:**
+```c
+connection_t* conn = events[i].data.ptr;
+uint32_t epoll_events = events[i].events;
+
+uint32_t mask = connectionHandler(conn, epoll_events);
+
+if (mask == UINT32_MAX) {
+    // Connection closed
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+    closeConnection(conn);
+} else {
+    // Update epoll interest
+    struct epoll_event temp_ev;
+    temp_ev.data.ptr = conn;
+    temp_ev.events = mask;
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &temp_ev);
+}
 ```
 
-### Concurrency Model Characteristics
+**Event Mask Values:**
+- `EPOLLIN`: Connection ready for reading
+- `EPOLLOUT`: Connection ready for writing
+- `EPOLLIN | EPOLLOUT`: Ready for both (rare)
+- `UINT32_MAX`: Close connection (special value)
 
-**Advantages:**
-- **Process Isolation**: Each client completely isolated from others (memory, file descriptors, signals)
-- **No Synchronization**: No mutex/lock needs (no shared state between processes)
-- **Crash Safety**: One client's misbehavior (segfault, infinite loop) doesn't affect others
-- **Simple Cleanup**: Process exit automatically closes client socket and frees memory
-- **Inherited Resources**: Child shares program text (read-only), inherits parent state via copy-on-write
+**Handler Return Values:**
+The connectionHandler() returns event mask for next interest:
+- Return EPOLLIN → Wait for more data to read
+- Return EPOLLOUT → Wait for socket writable
+- Return UINT32_MAX → Close connection
 
-**Disadvantages:**
-- **Memory Overhead**: Each process duplicates program data / stacks (even with copy-on-write)
-- **Process Creation Cost**: `fork()` and context switches more expensive than thread creation
-- **Scalability Limit**: OS limits on process count (practical limit: 10K-100K processes)
-- **No Shared Resources**: Can't easily pool resources like database connections across clients
+### 5. Connection Lifecycle
 
-**Suitable For:**
-- Learning process-based concurrency model
-- Moderate connection counts (< 1K concurrent clients)
-- Teaching systems concepts: fork, wait, signals, process isolation
+**Initialization:**
+```c
+void initializeConnection(connection_t* conn, int fd, int fileRootFd);
+```
 
-## Critical Invariants
+- Allocates read buffer (4KB initial)
+- Allocates write buffer (64KB)
+- Sets initial state to READING_HEADERS
+- Stores root_fd for file access
 
-### Buffer Invariants
-1. **Size Bounds**: `0 < buffer_size ≤ MAX_REQUEST_LIMIT`
-2. **Offset Ordering**: `parseOffset ≤ readOffset ≤ buffer_size`
-3. **Null Termination**: `buffer[readOffset] == '\0'` after each read
-4. **Non-overlapping Shift**: `memmove()` handles overlapping memory correctly
+**State Transitions:**
+1. **READING_HEADERS** → Read until "\r\n\r\n" found
+2. **READING_BODY** → Read Content-Length bytes (if needed)
+3. **PROCESSING** → Parse URL, route request, generate response
+4. **WRITING_RESPONSE** → Write HTTP headers and body
+5. **SENDING_FILE** → Use sendfile() for static files
+6. **CLOSING** → Clean up and free resources
 
-### Connection Invariants
-1. **Single Connection**: Server handles exactly one connection at a time
-2. **Sequential Processing**: Requests processed in arrival order (no interleaving)
-3. **Clean State**: Each request starts with fresh `httpInfo_t` initialization
-4. **Deterministic Cleanup**: Connection always closed via cleanup label
+**Cleanup:**
+```c
+void closeConnection(connection_t* conn);
+```
 
-### Parser Contract
-1. **Buffer Ownership**: Server owns buffer, parser receives non-owning views
-2. **Parsed Data Lifetime**: `bufferView_t` pointers valid only until next buffer modification
-3. **No Side Effects**: Parser never modifies input buffer
-4. **Error Atomicity**: Parse errors leave buffer in consistent state
+- Closes client socket fd
+- Closes file_fd if opened
+- Frees read_buf and write_buf
+- Frees connection_t structure
 
-## Known Limitations & Missing Features
+## Non-Blocking I/O Patterns
 
-### Concurrency & Scalability (v0.3 Partial Improvement)
-- ✅ **Process-Per-Connection**: Server now handles multiple concurrent clients via `fork()`
-- ✅ **Zombie Process Cleanup**: SIGCHLD handler prevents accumulation of defunct children
-- ❌ **No Threading**: No alternative threaded model yet
-- ❌ **No Event Loop**: Blocking I/O only (no epoll/kqueue/select)
-- ❌ **Small Listen Backlog**: `listen(3)` provides minimal queue
+### Partial Reads
 
-### Timeouts & Resource Management
-- **No Connection Timeout**: Can hang indefinitely waiting for client data
-- **No Request Timeout**: Slow clients can hold connection indefinitely
-- **No Idle Timeout**: Keep-alive connections never timeout
-- **No Read Timeout**: `read()` blocks forever if client stops sending
-- **No Max Connections**: No limit on sequential connections
+```c
+ssize_t valread = read(fd, buffer + offset, remaining);
 
-### Configuration & Flexibility
-- **Hardcoded Port**: Port 8080 not configurable via arguments or config file
-- **Fixed Buffer Sizes**: Constants not adjustable at runtime
-- **No Environment Variables**: Cannot configure via ENV
-- **No Command-line Arguments**: No flags for port, log level, etc.
+if (valread > 0) {
+    offset += valread;  // Made progress
+    // Continue reading if needed
+} else if (valread == 0) {
+    // Connection closed by client
+    return CLOSE_CONNECTION;
+} else {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // No data available, wait for next EPOLLIN
+        return EPOLLIN;
+    }
+    // Real error
+    return CLOSE_CONNECTION;
+}
+```
 
-### Error Handling & Recovery
-- **Fatal Parse Errors**: Any parse error terminates connection (no recovery)
-- **No Graceful Degradation**: Cannot downgrade protocol version
-- **Memory Allocation Failures**: Only some failures handled (inconsistent)
-- **No Error Logging**: Errors not logged to file or stderr
-- **Connection Abort Handling**: Abrupt client disconnect may leave inconsistent state
+### Partial Writes
 
-### Observability & Debugging
-- **No Logging Framework**: Only basic `printf()` statements
-- **No Request Logging**: Method/path/status not recorded
-- **No Client IP Logging**: Source address not captured
-- **No Metrics**: No connection count, request rate, error rate tracking
-- **No Access Logs**: Cannot replay or audit requests
-- **No Debug Mode**: No verbose logging option
+```c
+ssize_t sent = write(fd, buffer + offset, remaining);
 
-### Signal Handling & Lifecycle
-- ✅ **SIGCHLD Handler (v0.3)**: Reaps child processes via `burnZombies()` function
-- ❌ **No Graceful Shutdown**: SIGINT/SIGTERM terminate abruptly
-- ❌ **No Other Signal Handlers**: Cannot handle SIGPIPE, SIGHUP, etc.
-- ❌ **No Cleanup on Exit**: Resources may leak on abnormal termination
-- ❌ **No Daemon Mode**: Cannot run as background service
+if (sent > 0) {
+    offset += sent;
+    if (offset < total) {
+        // More to write, wait for EPOLLOUT
+        return EPOLLOUT;
+    }
+    // Write complete
+    return next_state();
+} else {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Socket buffer full, wait for EPOLLOUT
+        return EPOLLOUT;
+    }
+    // Error
+    return CLOSE_CONNECTION;
+}
+```
 
-### Protocol Features
-- **No HTTP/1.0 Support**: Only HTTP/1.1 accepted
-- **No HTTP/2**: No protocol upgrade support
-- **No HTTPS/TLS**: Plain HTTP only
-- **No Compression**: gzip/deflate not supported in any layer
+## Memory Management
 
-### Performance Optimizations
-- **No Zero-Copy I/O**: No sendfile() or splice() usage
-- **No Buffer Pooling**: Allocates/frees buffer per connection
-- **No Header Caching**: Parsed headers not cached across requests
-- **Linear Error Lookup**: Error table scanned sequentially
+### Per-Connection Buffers
 
-### Security & Hardening
-- **No Rate Limiting**: Vulnerable to request flooding
-- **No Connection Limits**: No per-IP connection restrictions
-- **No Request Size Validation**: Relies only on buffer limit
-- **No Input Sanitization**: Minimal validation of paths/headers
-- **No DoS Protection**: No slowloris or similar attack mitigation
+**Read Buffer:**
+- Initial: 4KB (READ_BUFFER_SIZE)
+- Grows dynamically as needed
+- Maximum: 8KB for headers (MAX_HEADER_SIZE)
 
-## Future Enhancements
+**Write Buffer:**
+- Initial: 64KB (MIN_RESPONSE_BUFFER)
+- Holds complete HTTP response headers/body
+- For static files, only headers (body via sendfile)
 
-1. **Multi-threading**: Thread pool for concurrent connections
-2. **Timeout System**: Configurable timeouts for all I/O operations
-3. **Signal Handling**: Graceful shutdown on SIGTERM/SIGINT
-4. **Logging System**: Structured logging with log levels
-5. **Configuration**: Command-line arguments and config file support
-6. **Metrics & Monitoring**: Request/response statistics
-7. **Resource Limits**: Max connections, max requests per connection
-8. **Performance**: Buffer pooling, zero-copy I/O, optimized lookups
-9. **Protocol Extensions**: HTTP/1.0 support, upgrade mechanisms
-10. **Security**: Rate limiting, input validation, DoS protection
+**Lifecycle:**
+- Allocated in initializeConnection()
+- Reused across multiple requests (keep-alive)
+- Freed in closeConnection()
+
+### File Descriptors
+
+**Root Directory FD:**
+```c
+int docroot_fd = open("public", O_RDONLY | O_DIRECTORY);
+```
+
+- Opened once at startup
+- Shared across all connections
+- Never closed (live for server lifetime)
+
+**Per-Request File FD:**
+```c
+conn->file_fd = openat(conn->root_fd, path, O_RDONLY);
+```
+
+- Opened in handler when serving static file
+- Closed after sendfile() complete
+- Prevents directory traversal via openat()
+
+## Error Handling
+
+### Accept Errors
+
+```c
+if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    perror("accept");
+    // Continue event loop (don't exit)
+}
+```
+
+- EAGAIN/EWOULDBLOCK are normal (no more connections)
+- Other errors logged but server continues
+
+### Epoll Errors
+
+```c
+if (epoll_wait(...) == -1) {
+    perror("epoll_wait");
+    break;  // Exit event loop
+}
+```
+
+- epoll_wait() failure is fatal
+- Server exits on epoll errors
+
+### Connection Errors
+
+Handled inside connectionHandler():
+- Read errors → close connection
+- Write errors → close connection
+- Parse errors → send error response, close
+- Invalid state → close connection
+
+## Performance Characteristics
+
+### Scalability
+
+- **C10K Capable**: Handles 10,000+ concurrent connections
+- **Single Process**: No fork/thread overhead
+- **Minimal Context Switches**: Only on I/O events
+- **Memory Efficient**: ~70KB per idle connection
+
+### Benchmarks
+
+**Test Environment:**
+- AMD Ryzen 5 5600H (12 cores)
+- Linux with epoll
+- Apache Bench (ab)
+
+**Results:**
+- Static file serving: ~14,300 req/sec (c=10)
+- API endpoints: ~14,300 req/sec (c=10)
+- Mean latency: 0.7ms
+- Zero failed requests
+
+**Comparison to v0.4 (fork-based):**
+- 38% higher throughput
+- 30% lower latency
+- 90% less memory per connection
+
+## Limitations
+
+### Current Limitations
+
+1. **Single-Threaded**: CPU-bound operations block event loop
+2. **Linux-Only**: Uses epoll (not portable to BSD/macOS)
+3. **No Timeout Handling**: Idle connections persist indefinitely
+4. **No Connection Limits**: Can exhaust file descriptors
+5. **No Priority**: All connections treated equally
+
+### Future Improvements
+
+1. **Worker Threads**: Offload CPU-intensive tasks to thread pool
+2. **Connection Timeouts**: Close idle connections after timeout
+3. **Max Connections**: Limit concurrent connections
+4. **Load Balancing**: Distribute connections across worker threads
+5. **Portable I/O**: Abstract epoll/kqueue/io_uring
+
+## Code Example
+
+### Minimal Event Loop
+
+```c
+while (1) {
+    int n = epoll_wait(epoll_fd, events, 100, -1);
+    
+    for (int i = 0; i < n; i++) {
+        if (events[i].data.fd == server_fd) {
+            // New connections
+            while ((fd = accept(server_fd, ...)) != -1) {
+                set_nonblocking(fd);
+                connection_t* conn = new_connection(fd);
+                epoll_add(epoll_fd, fd, EPOLLIN, conn);
+            }
+        } else {
+            // Client I/O
+            connection_t* conn = events[i].data.ptr;
+            uint32_t mask = handle_connection(conn, events[i].events);
+            
+            if (mask == CLOSE) {
+                epoll_del(epoll_fd, conn->fd);
+                free_connection(conn);
+            } else {
+                epoll_mod(epoll_fd, conn->fd, mask, conn);
+            }
+        }
+    }
+}
+```
+
+## Debugging Tips
+
+### Check Connection Count
+
+```bash
+# Count active connections
+lsof -p $(pgrep server) | grep TCP | wc -l
+```
+
+### Monitor epoll Events
+
+Add debug prints in event loop:
+```c
+printf("epoll_wait returned %d events\n", n);
+for (int i = 0; i < n; i++) {
+    printf("Event: fd=%d, events=0x%x\n", fd, events[i].events);
+}
+```
+
+### Track State Machine
+
+Add logging in connectionHandler():
+```c
+printf("Connection %d: %s -> %s\n", 
+       conn->fd, state_name(old_state), state_name(conn->state));
+```
+
+## Related Documentation
+
+- [connection.md](connection.md) - Connection state machine details
+- [httpParser.md](httpParser.md) - HTTP parsing implementation
+- [handlers.md](handlers.md) - Request routing and response generation
+- [BENCHMARKS.md](BENCHMARKS.md) - Performance measurements
+
+## Version History
+
+- **v0.5**: Event-driven architecture with epoll
+- **v0.4**: Static file serving with sendfile()
+- **v0.3**: Process-based concurrency with fork()
+- **v0.2**: Keep-alive connection support
+- **v0.1**: Basic HTTP/1.1 parsing and response
