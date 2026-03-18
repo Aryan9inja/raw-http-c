@@ -39,7 +39,7 @@ void initializeConnection(connection_t* conn, int fd, int fileRootFd) {
     conn->file_fd = -1;
     conn->file_offset = 0;
     conn->file_remaining = 0;
-    fprintf(stdout, "Connection Initialized\n");
+    conn->shouldClose = 0;
 }
 
 void closeConnection(connection_t* conn) {
@@ -67,7 +67,6 @@ void handleHeaders(connection_t* conn) {
 
     if (!header_end) {
         // Wait for next EPOLLIN
-        fprintf(stdout, "No header end, returning\n");
         return;
     }
     // Calculate offset so that if later we realloc nothing changes
@@ -80,7 +79,6 @@ void handleHeaders(connection_t* conn) {
     }
 
     // parserResult_t requestAndHeaderParser()
-    fprintf(stdout, "Calling parser\n");
     parserResult_t headerParsingRes = requestAndHeaderParser(
         conn->read_buf + conn->parse_offset,
         conn->read_buf + conn->header_end + 2, // Because of my invarient in parser
@@ -88,13 +86,11 @@ void handleHeaders(connection_t* conn) {
     );
 
     if (headerParsingRes != OK) {
-        fprintf(stdout, "Parsing Error Encountered\n");
         handleParseError(headerParsingRes, conn);
         return;
     }
 
     // Since everyting is fine we can say header parsing completed
-    fprintf(stdout, "Header parsing successfull\n");
     conn->state = READING_BODY;
     // Update parse offset
     conn->parse_offset += header_size + 4;
@@ -104,8 +100,6 @@ void handleBody(connection_t* conn) {
     char* bodyStart = conn->read_buf + conn->parse_offset;
     parserResult_t bodyParserRes = bodyParser(bodyStart, &conn->request);
     if (bodyParserRes == OK) {
-        fprintf(stdout, "Body parsed\n");
-        fprintf(stdout, "Body start at:%c\n", conn->request.body.data[0]);
         conn->state = PROCESSING;
     }
     else {
@@ -116,7 +110,6 @@ void handleBody(connection_t* conn) {
 
 void handleRequestProcessing(connection_t* conn) {
     // decode url
-    fprintf(stdout, "Entered parsing\n");
     parserResult_t processingRes = OK;
     conn->request.decodedPath.len = 0;
     conn->request.normalizedPath.len = conn->request.normalizedPathCap;
@@ -125,7 +118,6 @@ void handleRequestProcessing(connection_t* conn) {
         handleParseError(processingRes, conn);
         return;
     }
-    fprintf(stdout, "Url decoded\n");
 
     // normalize url
     processingRes = normalizePath(&conn->request.decodedPath, &conn->request.normalizedPath);
@@ -133,27 +125,23 @@ void handleRequestProcessing(connection_t* conn) {
         handleParseError(processingRes, conn);
         return;
     }
-    fprintf(stdout, "Decoded url normalized\n");
 
     // Request processing
     response_t generatedResponse = requestHandler(&conn->request, conn->root_fd);
-    fprintf(stdout, "Generated Response status code:%d\n", generatedResponse.statusCode);
-    fprintf(stdout, "Response generated\n");
 
     createWritableResponse(&generatedResponse, &conn->write_buf, &conn->write_len);
-    fprintf(stdout, "Changing state to write\n");
     if (!conn->request.isApi) {
         conn->file_fd = generatedResponse.fileDescriptor;
         conn->file_remaining = generatedResponse.fileSize;
         conn->file_offset = 0;
     }
+    conn->shouldClose = generatedResponse.shouldClose;
     conn->state = WRITING_RESPONSE;
 }
 
 void handleRead(connection_t* conn) {
     while (1) {
         // Read into remaining buffer
-        fprintf(stdout, "Reading the request buffer\n");
         ssize_t valread = read(conn->fd, conn->read_buf + conn->read_len, conn->read_cap - conn->read_len);
         if (valread > 0) {
             conn->read_len += valread;
@@ -193,15 +181,12 @@ void handleRead(connection_t* conn) {
         return;
     }
     if (conn->state == READING_HEADERS) {
-        fprintf(stdout, "Starting header parsing\n");
         handleHeaders(conn);
     }
     if (conn->state == READING_BODY) {
-        fprintf(stdout, "Starting body parsing\n");
         handleBody(conn);
     }
     if (conn->state == PROCESSING) {
-        fprintf(stdout, "Starting request processing\n");
         handleRequestProcessing(conn);
     }
 }
@@ -224,17 +209,20 @@ void handleSend(connection_t* conn) {
 
     if (!conn->request.isApi) {
         conn->state = SENDING_FILE;
-        fprintf(stdout, "Changing state to file\n");
         return;
     }
-    conn->state = READING_HEADERS;
+
+    // Check if we should close or keep-alive
+    if (conn->shouldClose) {
+        conn->state = CLOSING;
+    } else {
+        conn->state = READING_HEADERS;
+    }
 }
 
 void handleFileSend(connection_t* conn) {
-    fprintf(stdout, "Entered handleFileSend\n");
     off_t offset = conn->file_offset;
     size_t remainingFileSize = conn->file_remaining;
-    fprintf(stdout, "Remaining = %zu\n", remainingFileSize);
     while (remainingFileSize > 0) {
         size_t byteCount = remainingFileSize;
         ssize_t sent = sendfile(conn->fd, conn->file_fd, &offset, byteCount);
@@ -253,7 +241,13 @@ void handleFileSend(connection_t* conn) {
     }
     close(conn->file_fd);
     conn->file_fd = conn->root_fd;
-    conn->state = READING_HEADERS;
+
+    // Check if we should close or keep-alive
+    if (conn->shouldClose) {
+        conn->state = CLOSING;
+    } else {
+        conn->state = READING_HEADERS;
+    }
 }
 
 // I will first write about when there is parse error state
@@ -275,7 +269,6 @@ uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
     if (events & EPOLLIN) {
         handleRead(conn);
         if (conn->state == WRITING_RESPONSE) {
-            fprintf(stdout, "Switching to write\n");
             return EPOLLOUT;
         }
         if (conn->state == CLOSING) {
@@ -287,7 +280,6 @@ uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
         // Reading headers because in request loop I will go back to reading newRequest headers
         handleWrite(conn);
         if (conn->state == READING_HEADERS) {
-            fprintf(stdout, "Switching to read\n");
             return EPOLLIN;
         }
         if (conn->state == CLOSING) {

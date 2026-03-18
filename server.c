@@ -106,7 +106,6 @@ int main() {
                         close(new_socket);
                         free(conn);
                     }
-                    fprintf(stdout, "Epoll event added for request\n");
 
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -124,7 +123,6 @@ int main() {
                         return EXIT_FAILURE;
                     }
                     closeConnection(conn);
-                    fprintf(stdout, "Epoll event deleted for request\n");
                 }
                 else {
                     struct epoll_event temp_ev;
@@ -134,7 +132,6 @@ int main() {
                         perror("epoll_ctl: mod epollin");
                         connectionHandler(conn, EPOLLERR); // This is my invariant
                     }
-                    fprintf(stdout, "Epoll event modified for request\n");
                 }
             }
         }

@@ -171,7 +171,6 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
         return;
     }
 
-    printf("Serving file: %s\n", relativePath);
     getFileType(relativePath, response);
     free(relativePath);
 

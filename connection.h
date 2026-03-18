@@ -38,6 +38,9 @@ typedef struct connection {
     off_t file_offset;
     size_t file_remaining;
 
+    // connection management
+    int shouldClose;  // whether to close after this connection
+
     httpInfo_t request;
 }connection_t;
 

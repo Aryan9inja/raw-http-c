@@ -250,7 +250,6 @@ parserResult_t requestAndHeaderParser(char* buffer, char* headerEnd, httpInfo_t*
 
     // Validate: GET requests should not have a body
     if (httpInfo->method.data[0] == 'G' && httpInfo->contentLength != 0) {
-        printf("The content length is %zu\n", httpInfo->contentLength);
         return BODY_NOT_ALLOWED;
     }
 
