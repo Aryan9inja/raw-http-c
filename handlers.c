@@ -157,7 +157,6 @@ void fileHandler(response_t* response, httpInfo_t* httpInfo, int root_fd) {
     }
 
     if ((staticFile_fd = openat(root_fd, relativePath, O_RDONLY)) == -1) {
-        perror("OpenAt failed");
         free(relativePath);
         if (errno == ENOENT || errno == ENOTDIR) {
             setNotFoundError(response);

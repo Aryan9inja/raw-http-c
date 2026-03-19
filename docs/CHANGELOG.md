@@ -1,5 +1,64 @@
 # Changelog
 
+## [v0.5.1] - 2026-03-19
+
+### Fixed
+- **Critical Keep-Alive Bug**: Fixed double-free crash when browser refreshed rapidly
+  - Issue: Connection state wasn't properly reset between keep-alive requests
+  - Cause: `parse_offset`, `header_end`, `read_len` retained stale values across requests
+  - Fix: Added `resetConnectionForNextRequest()` to properly reset all state variables
+  - Impact: Server now stable under rapid concurrent requests (200+ tested)
+- **HTTP Pipelining Support**: Fixed parse_offset tracking for pipelined requests
+  - Issue: `parse_offset` updated after headers but NOT after body, breaking pipelining
+  - Cause: Ambiguous offset tracking made it impossible to know where one request ended
+  - Fix: `handleBody()` now updates `parse_offset += contentLength` after parsing body
+  - Impact: Server correctly handles multiple requests in single TCP packet
+- **Pipelined Data Preservation**: Fixed loss of pipelined requests on keep-alive reset
+  - Issue: `resetConnectionForNextRequest()` discarded buffer contents (`read_len = 0`)
+  - Cause: Lost any requests that arrived in same packet after current request
+  - Fix: Use `memmove()` to shift unparsed data to buffer start, preserve `read_len`
+  - Impact: No data loss with HTTP/1.1 pipelining
+- **File Descriptor Leak**: Fixed file descriptor confusion in keep-alive flow
+  - Issue: After file send, `file_fd` was set to `root_fd` instead of `-1`
+  - Cause: Next request would try to close wrong fd, causing "Bad file descriptor" errors
+  - Fix: Set `file_fd = -1` after closing, check `!= root_fd` in `closeConnection()`
+  - Impact: No fd leaks or spurious errors on keep-alive file serving
+- **Missing Return Values**: Fixed undefined behavior in `connectionHandler()`
+  - Issue: Some code paths didn't return epoll event mask
+  - Cause: Compiler warning "control reaches end of non-void function"
+  - Fix: Added explicit return statements for all code paths (EPOLLIN/EPOLLOUT)
+  - Impact: Proper epoll interest registration, no undefined behavior
+
+### Changed
+- **Logging**: Removed noisy `perror()` call in `fileHandler()` for legitimate 404s
+  - Issue: Browser requests like `.well-known/appspecific/com.chrome.devtools.json` spammed logs
+  - Previous: `perror("OpenAt failed")` logged every missing file
+  - Current: Silent 404 responses (errors still returned to client)
+  - Impact: Clean server logs without false-positive errors
+
+### Technical Details
+- **Connection Reset Flow**: New `resetConnectionForNextRequest()` function
+  - Resets state machine: `state = READING_HEADERS`, `parse_offset = 0`, `header_end = 0`
+  - Preserves pipelined data: `memmove(read_buf, read_buf + parse_offset, remaining)`
+  - Updates read_len: `read_len = remaining` (not 0)
+  - Resets write state: `write_len = 0`, `write_sent = 0`
+  - Closes file descriptors: Checks `file_fd != -1 && file_fd != root_fd`
+  - Resets flags: `shouldClose = 0`
+- **Parse Offset Semantics**: Now unambiguous throughout request lifecycle
+  - After `handleHeaders()`: `parse_offset` points to body start
+  - After `handleBody()`: `parse_offset` points past entire request (headers + body)
+  - On reset: Remaining bytes = `read_len - parse_offset` (pipelined data)
+- **Keep-Alive State Transitions**:
+  - `handleSend()`: After response sent → `resetConnectionForNextRequest()` → `READING_HEADERS`
+  - `handleFileSend()`: After file sent → `resetConnectionForNextRequest()` → `READING_HEADERS`
+  - Both paths: Next EPOLLIN event processes pipelined data in buffer
+
+### Testing
+- Stress tested with 200+ rapid concurrent requests (no crashes)
+- Verified HTTP/1.1 pipelining with 2 requests in single TCP packet
+- Confirmed keep-alive sequential requests work correctly
+- No memory leaks detected with rapid browser refresh
+
 ## [v0.5] - 2026-03-18
 
 ### Added

@@ -44,12 +44,41 @@ void initializeConnection(connection_t* conn, int fd, int fileRootFd) {
 
 void closeConnection(connection_t* conn) {
     close(conn->fd);
-    if (conn->file_fd != conn->root_fd) {
+    if (conn->file_fd != -1 && conn->file_fd != conn->root_fd) {
         close(conn->file_fd);
     }
     free(conn->read_buf);
     free(conn->write_buf);
     free(conn);
+}
+
+void resetConnectionForNextRequest(connection_t* conn) {
+    // Handle pipelined requests: move any unprocessed data to front of buffer
+    // parse_offset now points to the end of the current request
+    size_t remaining = conn->read_len - conn->parse_offset;
+    if (remaining > 0) {
+        // Move remaining data to front of buffer
+        memmove(conn->read_buf, conn->read_buf + conn->parse_offset, remaining);
+    }
+
+    // Reset state for next request
+    conn->state = READING_HEADERS;
+    conn->header_end = 0;
+    conn->parse_offset = 0;
+    conn->read_len = remaining;  // Keep pipelined data
+
+    // Reset write buffer tracking
+    conn->write_len = 0;
+    conn->write_sent = 0;
+
+    // Reset file sending state
+    if (conn->file_fd != -1 && conn->file_fd != conn->root_fd) {
+        close(conn->file_fd);
+    }
+    conn->file_fd = -1;
+    conn->file_offset = 0;
+    conn->file_remaining = 0;
+    conn->shouldClose = 0;
 }
 
 void handleHeaders(connection_t* conn) {
@@ -101,6 +130,9 @@ void handleBody(connection_t* conn) {
     parserResult_t bodyParserRes = bodyParser(bodyStart, &conn->request);
     if (bodyParserRes == OK) {
         conn->state = PROCESSING;
+        // Update parse_offset to point past the entire request (headers + body)
+        // This is important for HTTP pipelining support
+        conn->parse_offset += conn->request.contentLength;
     }
     else {
         conn->state = CLOSING;
@@ -204,8 +236,8 @@ void handleSend(connection_t* conn) {
         conn->write_sent += sent;
     }
     // Reset for next request
-    conn->write_sent=0;
-    conn->write_len=0;
+    conn->write_sent = 0;
+    conn->write_len = 0;
 
     if (!conn->request.isApi) {
         conn->state = SENDING_FILE;
@@ -216,7 +248,7 @@ void handleSend(connection_t* conn) {
     if (conn->shouldClose) {
         conn->state = CLOSING;
     } else {
-        conn->state = READING_HEADERS;
+        resetConnectionForNextRequest(conn);
     }
 }
 
@@ -240,13 +272,13 @@ void handleFileSend(connection_t* conn) {
         remainingFileSize -= sent;
     }
     close(conn->file_fd);
-    conn->file_fd = conn->root_fd;
+    conn->file_fd = -1;
 
     // Check if we should close or keep-alive
     if (conn->shouldClose) {
         conn->state = CLOSING;
     } else {
-        conn->state = READING_HEADERS;
+        resetConnectionForNextRequest(conn);
     }
 }
 
@@ -268,12 +300,13 @@ uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
 
     if (events & EPOLLIN) {
         handleRead(conn);
-        if (conn->state == WRITING_RESPONSE) {
+        if (conn->state == WRITING_RESPONSE || conn->state == SENDING_FILE) {
             return EPOLLOUT;
         }
         if (conn->state == CLOSING) {
             return closingSignal;
         }
+        return EPOLLIN;
     }
 
     if (events & EPOLLOUT) {
@@ -285,5 +318,8 @@ uint32_t connectionHandler(connection_t* conn, u_int32_t events) {
         if (conn->state == CLOSING) {
             return closingSignal;
         }
+        return EPOLLOUT;
     }
+
+    return EPOLLIN;
 }

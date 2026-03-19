@@ -384,7 +384,7 @@ void handleWrite(connection_t* conn) {
         conn->state = CLOSING;
     } else {
         // Keep-alive: reset for next request
-        resetConnection(conn);
+        resetConnectionForNextRequest(conn);
     }
 }
 ```
@@ -435,41 +435,55 @@ void handleFileSend(connection_t* conn) {
 - sendfile() is zero-copy (kernel to socket)
 - Updates file_offset and file_remaining
 - Closes file_fd when complete
-- Supports keep-alive (resetConnection)
+- Supports keep-alive (resetConnectionForNextRequest)
 
-### `resetConnection()`
+### `resetConnectionForNextRequest()` (v0.5.1+)
 
 **Purpose**: Prepare connection for next request (keep-alive).
 
 ```c
-void resetConnection(connection_t* conn) {
-    // Shift unparsed data to buffer start
-    size_t unparsed = conn->read_len - conn->parse_offset;
-    if (unparsed > 0) {
-        memmove(conn->read_buf, 
+void resetConnectionForNextRequest(connection_t* conn) {
+    // Shift unparsed data (pipelined requests) to buffer start
+    size_t remaining = conn->read_len - conn->parse_offset;
+    if (remaining > 0) {
+        memmove(conn->read_buf,
                 conn->read_buf + conn->parse_offset,
-                unparsed);
+                remaining);
     }
-    
-    conn->read_len = unparsed;
-    conn->parse_offset = 0;
-    conn->header_end = 0;
-    conn->write_sent = 0;
-    conn->write_len = 0;
+
+    // Reset state for next request
     conn->state = READING_HEADERS;
-    
-    // If pipelined request already in buffer, process immediately
-    if (conn->read_len > 0) {
-        handleHeaders(conn);
+    conn->header_end = 0;
+    conn->parse_offset = 0;
+    conn->read_len = remaining;  // Preserve pipelined data
+
+    // Reset write buffer tracking
+    conn->write_len = 0;
+    conn->write_sent = 0;
+
+    // Reset file sending state
+    if (conn->file_fd != -1 && conn->file_fd != conn->root_fd) {
+        close(conn->file_fd);
     }
+    conn->file_fd = -1;
+    conn->file_offset = 0;
+    conn->file_remaining = 0;
+    conn->shouldClose = 0;
 }
 ```
 
 **Key Points:**
-- Preserves unparsed data (pipelined requests)
-- Resets all offsets and lengths
-- Returns to READING_HEADERS
-- Processes pipelined requests immediately
+- **Preserves pipelined data**: Unparsed bytes after current request kept in buffer
+- **Resets all state**: Offsets, lengths, flags all reset for fresh request
+- **Returns to READING_HEADERS**: Next EPOLLIN event will process buffered data
+- **Closes file descriptors**: Ensures no fd leaks between requests
+- **Does NOT process immediately**: Buffered data handled on next event loop iteration
+
+**v0.5.1 Changes:**
+- Function renamed from `resetConnection()` to `resetConnectionForNextRequest()`
+- Fixed file descriptor handling: checks `file_fd != root_fd` before closing
+- Removed immediate pipelined processing (was causing partial request issues)
+- Properly resets `shouldClose` flag to allow next keep-alive
 
 ### `handleParseError()`
 
@@ -559,7 +573,7 @@ GET /page3 HTTP/1.1\r\n\r\n
 1. **Read Phase**: All pipelined requests read into buffer
 2. **Parse Phase**: First request parsed (parse_offset marks end)
 3. **Response Phase**: Response sent
-4. **Reset Phase**: resetConnection() moves unparsed data to start
+4. **Reset Phase**: resetConnectionForNextRequest() moves unparsed data to start
 5. **Loop**: Immediately process next request if data available
 
 **Key Fields:**
@@ -580,7 +594,7 @@ GET /page3 HTTP/1.1\r\n\r\n
 **Lifetime Rules:**
 1. Parse data valid after requestAndHeaderParser()
 2. Valid through PROCESSING and response generation
-3. Invalid after resetConnection() (buffer shifted)
+3. Invalid after resetConnectionForNextRequest() (buffer shifted)
 4. For keep-alive, data must be processed before reset
 
 ### Dynamic Allocations
@@ -593,7 +607,7 @@ GET /page3 HTTP/1.1\r\n\r\n
 **Per Request:**
 - decodedPath buffer (inside httpInfo_t)
 - normalizedPath buffer (inside httpInfo_t)
-- Freed implicitly in resetConnection()
+- Freed implicitly in resetConnectionForNextRequest()
 
 ## Error Handling
 
