@@ -2,6 +2,30 @@
 
 A lightweight HTTP/1.1 server implementation in C with static file serving, event-driven architecture using epoll, persistent connection support (keep-alive), request pipelining, and zero-copy parsing.
 
+## Deep Dive
+1. server.c
+   
+   <img width="740" height="559" alt="server c" src="https://github.com/user-attachments/assets/ad8d0697-2860-4e07-895b-499b38aea984" />
+
+2. connection.c
+
+   <img width="1268" height="558" alt="connection c" src="https://github.com/user-attachments/assets/44ec1f73-b44c-4b54-b46e-24d28531ee2e" />
+
+3. STATE-MACHINE
+
+   <img width="585" height="735" alt="stateMachine" src="https://github.com/user-attachments/assets/07f9c3fd-065b-425c-b10e-22f48a0cd1c0" />
+
+4. httpParser.c
+
+   <img width="600" height="313" alt="httpParser c" src="https://github.com/user-attachments/assets/3a7e29fc-4327-435f-b729-f93dfc4d44d5" />
+
+5. handlers.c
+
+   <img width="577" height="297" alt="handlers" src="https://github.com/user-attachments/assets/82980927-b02b-406c-b050-74268032e772" />
+
+
+   
+
 ## Features
 
 ### Core Capabilities
